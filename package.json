@@ -1,0 +1,47 @@
+{
+  "name": "launcher-fuego",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --webpack -p 3001",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "@cora-xyz/anchor-0.28.0": "npm:@coral-xyz/anchor@0.28.0",
+    "@coral-xyz/anchor": "^0.32.1",
+    "@meteora-ag/alpha-vault": "file:./vendor/alpha-vault-sdk",
+    "@metaplex-foundation/mpl-token-metadata": "^2.13.0",
+    "@meteora-ag/cp-amm-sdk": "^1.4.0",
+    "@meteora-ag/dlmm": "^1.9.3",
+    "@meteora-ag/dynamic-amm-sdk": "^1.4.1",
+    "@meteora-ag/m3m3": "^1.0.10",
+    "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "^1.98.4",
+    "axios": "^1.13.5",
+    "bn.js": "^5.2.2",
+    "bs58": "^6.0.0",
+    "csv-parse": "^6.1.0",
+    "csv-stringify": "^6.6.0",
+    "decimal.js": "^10.6.0",
+    "form-data": "^4.0.5",
+    "lucide-react": "^0.563.0",
+    "next": "16.1.6",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/bn.js": "^5.2.0",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@types/uuid": "^10.0.0",
+    "eslint": "^9",
+    "eslint-config-next": "16.1.6",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}
