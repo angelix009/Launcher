@@ -27,6 +27,7 @@ import {
   Recycle,
   ExternalLink,
   Shield,
+  Zap,
 } from 'lucide-react';
 import type { WalletEntry, TransactionLog } from '@/types';
 import { v4 as uuidv4 } from 'uuid';
@@ -70,6 +71,11 @@ export default function WalletManager({
   const [mintTotalCap, setMintTotalCap] = useState('');
   const [fundAtaAmount, setFundAtaAmount] = useState('0.02');
   const [usdcAmounts, setUsdcAmounts] = useState<Record<string, string>>({});
+  const [warmupRunning, setWarmupRunning] = useState(false);
+  const [warmupTradesPerWallet, setWarmupTradesPerWallet] = useState('4');
+  const [warmupBuyMin, setWarmupBuyMin] = useState('0.001');
+  const [warmupBuyMax, setWarmupBuyMax] = useState('0.003');
+  const [warmupProgress, setWarmupProgress] = useState('');
   const [usdcRangeMin, setUsdcRangeMin] = useState('');
   const [usdcRangeMax, setUsdcRangeMax] = useState('');
   const [usdcFixedAmount, setUsdcFixedAmount] = useState('');
@@ -568,6 +574,44 @@ export default function WalletManager({
     }
   };
 
+  // Warmup: trade random pump.fun tokens
+  const handleWarmup = async () => {
+    if (selectedWallets.length === 0) {
+      setError('Select wallets to warm up');
+      return;
+    }
+    setError(null);
+    setWarmupRunning(true);
+    setWarmupProgress(`Starting warmup for ${selectedWallets.length} wallets...`);
+    try {
+      const res = await fetch('/api/warmup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          wallets: selectedWallets,
+          network,
+          tradesPerWallet: parseInt(warmupTradesPerWallet) || 4,
+          buyAmountMinSol: parseFloat(warmupBuyMin) || 0.001,
+          buyAmountMaxSol: parseFloat(warmupBuyMax) || 0.003,
+        }),
+      });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error);
+      const s = data.data.summary;
+      const msg = `Warmup done: ${s.successBuys} buys, ${s.successSells} sells, ${s.failures} failures across ${s.wallets} wallets`;
+      setWarmupProgress(msg);
+      onAddLog(createLog('warmup', 'success', msg));
+      await handleRefreshBalances();
+    } catch (err) {
+      const msg = (err as Error).message;
+      setError(msg);
+      setWarmupProgress(`Failed: ${msg}`);
+      onAddLog(createLog('warmup', 'error', `Warmup failed: ${msg}`));
+    } finally {
+      setWarmupRunning(false);
+    }
+  };
+
   // USDC distribute helpers
   const usdcTotal = selectedWallets.reduce((acc, w) => acc + (parseFloat(usdcAmounts[w.id] || '0') || 0), 0);
 
@@ -610,21 +654,34 @@ export default function WalletManager({
         ? 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
         : '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU';
 
+      // Only send wallets that have a USDC amount > 0
+      const walletsToSend = selectedWallets.filter(w => (perWalletAmounts[w.id] || 0) > 0);
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5 * 60 * 1000); // 5min timeout
+
       const res = await fetch('/api/wallets/distribute', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           privateKey: funderPrivateKey,
           tokenMint: USDC_MINT,
-          wallets: selectedWallets,
+          wallets: walletsToSend,
           perWalletAmounts,
           mode: 'transfer',
           network,
         }),
       });
+      clearTimeout(timeout);
       const data = await res.json();
       if (!data.success) throw new Error(data.error);
-      onAddLog(createLog('transfer', 'success', `Distributed ${usdcTotal.toFixed(2)} USDC to ${selectedWallets.length} wallets`, data.data?.signatures?.[0] || 'N/A'));
+      const errCount = data.data?.errors?.length || 0;
+      const successCount = data.data?.count || 0;
+      const msg = errCount > 0
+        ? `USDC: ${successCount} sent, ${errCount} failed`
+        : `Distributed ${usdcTotal.toFixed(2)} USDC to ${successCount} wallets`;
+      onAddLog(createLog('transfer', errCount > 0 ? 'warning' : 'success', msg, data.data?.signatures?.[0] || 'N/A'));
       await handleRefreshBalances();
     } catch (err) {
       const msg = (err as Error).message;
@@ -1514,6 +1571,66 @@ export default function WalletManager({
                     </div>
                   </div>
                 </div>
+              </div>
+
+              {/* ── Warmup: Trade Random Tokens ── */}
+              <div>
+                <label className="text-sm text-[#a1a1aa] font-medium mb-2 block">
+                  Warmup — Trade Random Pump.fun Tokens
+                </label>
+                <p className="text-xs text-[#52525b] mb-3">
+                  Each wallet buys & sells random pump.fun tokens to build trade history. Different tokens per wallet.
+                </p>
+                <div className="flex items-center gap-3 mb-3">
+                  <div className="flex-1">
+                    <label className="text-xs text-[#71717a] block mb-1">Trades per wallet</label>
+                    <input
+                      type="number"
+                      value={warmupTradesPerWallet}
+                      onChange={(e) => setWarmupTradesPerWallet(e.target.value)}
+                      min={1} max={10}
+                      className="w-full bg-[#09090b] border border-[#27272a] rounded-lg px-3 py-1.5 text-white text-sm font-mono focus:ring-2 focus:ring-amber-500/50 focus:border-amber-500 outline-none transition-all text-right"
+                    />
+                  </div>
+                  <div className="flex-1">
+                    <label className="text-xs text-[#71717a] block mb-1">Min SOL</label>
+                    <input
+                      type="number"
+                      value={warmupBuyMin}
+                      onChange={(e) => setWarmupBuyMin(e.target.value)}
+                      min={0.0001} step="0.001"
+                      className="w-full bg-[#09090b] border border-[#27272a] rounded-lg px-3 py-1.5 text-white text-sm font-mono focus:ring-2 focus:ring-amber-500/50 focus:border-amber-500 outline-none transition-all text-right"
+                    />
+                  </div>
+                  <div className="flex-1">
+                    <label className="text-xs text-[#71717a] block mb-1">Max SOL</label>
+                    <input
+                      type="number"
+                      value={warmupBuyMax}
+                      onChange={(e) => setWarmupBuyMax(e.target.value)}
+                      min={0.0001} step="0.001"
+                      className="w-full bg-[#09090b] border border-[#27272a] rounded-lg px-3 py-1.5 text-white text-sm font-mono focus:ring-2 focus:ring-amber-500/50 focus:border-amber-500 outline-none transition-all text-right"
+                    />
+                  </div>
+                  <div className="flex-1 pt-4">
+                    <button
+                      onClick={handleWarmup}
+                      disabled={warmupRunning || selectedWallets.length === 0}
+                      className="w-full bg-amber-600 hover:bg-amber-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-lg px-4 py-1.5 font-medium transition-colors flex items-center justify-center gap-2 text-sm"
+                    >
+                      {warmupRunning ? <Loader2 className="w-4 h-4 animate-spin" /> : <Zap className="w-4 h-4" />}
+                      {warmupRunning ? 'Warming up...' : 'Start Warmup'}
+                    </button>
+                  </div>
+                </div>
+                {warmupProgress && (
+                  <p className={`text-xs px-1 ${warmupProgress.includes('Failed') ? 'text-red-400' : 'text-amber-400'}`}>
+                    {warmupProgress}
+                  </p>
+                )}
+                <p className="text-xs text-[#52525b] px-1 mt-1">
+                  Cost: ~{(((parseFloat(warmupBuyMin || '0.001') + parseFloat(warmupBuyMax || '0.003')) / 2) * parseInt(warmupTradesPerWallet || '4') * selectedWallets.length * 0.01).toFixed(4)} SOL gas + buy amounts recovered on sell
+                </p>
               </div>
 
               {/* ── Distribute USDC ── */}

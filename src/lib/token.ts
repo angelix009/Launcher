@@ -69,12 +69,36 @@ export async function createToken2022(
   }
   const mint = mintKeypair.publicKey;
 
+  // Upload off-chain metadata JSON (Metaplex standard)
+  let metadataUri = config.imageUrl || '';
+  if (config.imageUrl) {
+    try {
+      const metadataJson = JSON.stringify({
+        name: config.name,
+        symbol: config.symbol,
+        description: config.description || '',
+        image: config.imageUrl,
+      });
+      const metadataBlob = new Blob([metadataJson], { type: 'application/json' });
+      const catboxForm = new FormData();
+      catboxForm.append('reqtype', 'fileupload');
+      catboxForm.append('fileToUpload', new File([metadataBlob], 'metadata.json', { type: 'application/json' }));
+      const catboxRes = await fetch('https://catbox.moe/user/api.php', { method: 'POST', body: catboxForm });
+      if (catboxRes.ok) {
+        const jsonUrl = (await catboxRes.text()).trim();
+        if (jsonUrl.startsWith('https://')) metadataUri = jsonUrl;
+      }
+    } catch (e) {
+      console.warn('Failed to upload metadata JSON, falling back to image URL:', e);
+    }
+  }
+
   // Build metadata for Token 2022 metadata extension
   const metadata: TokenMetadata = {
     mint: mint,
     name: config.name,
     symbol: config.symbol,
-    uri: config.imageUrl || '',
+    uri: metadataUri,
     additionalMetadata: config.description
       ? [['description', config.description]]
       : [],
@@ -129,7 +153,7 @@ export async function createToken2022(
       metadata: mint,
       name: config.name,
       symbol: config.symbol,
-      uri: config.imageUrl || '',
+      uri: metadataUri,
       mintAuthority: payer.publicKey,
       updateAuthority: payer.publicKey,
     })

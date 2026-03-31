@@ -4,6 +4,9 @@ import { getConnection, keypairFromPrivateKey } from '@/lib/solana';
 import { distributeTokens, mintToWallets } from '@/lib/wallets';
 import type { WalletEntry } from '@/types';
 
+export const dynamic = 'force-dynamic';
+export const maxDuration = 300;
+
 export async function POST(request: Request) {
   try {
     const body = await request.json();
@@ -54,6 +57,7 @@ export async function POST(request: Request) {
     const distributionMode = mode || 'mint';
 
     let signatures: string[];
+    let errors: { wallet: string; error: string }[] = [];
 
     if (distributionMode === 'mint') {
       // Direct mint to each wallet's ATA (SCMR pattern)
@@ -68,11 +72,10 @@ export async function POST(request: Request) {
       );
     } else {
       // Transfer mode: send from funder's ATA to each wallet, supporting perWalletAmounts
-      const { getOrCreateAssociatedTokenAccount, createTransferCheckedInstruction, getAssociatedTokenAddressSync } = await import('@solana/spl-token');
+      const { createAssociatedTokenAccountIdempotentInstruction, createTransferCheckedInstruction, getAssociatedTokenAddressSync } = await import('@solana/spl-token');
       const { Transaction } = await import('@solana/web3.js');
 
       const sigList: string[] = [];
-      const errors: { wallet: string; error: string }[] = [];
 
       // Pre-compute sender ATA once
       const senderAta = getAssociatedTokenAddressSync(mint, authority.publicKey, false, tokenProgram);
@@ -85,16 +88,22 @@ export async function POST(request: Request) {
           const rawAmount = BigInt(Math.round(amt * 10 ** decimals));
           const dest = new PublicKey(w.publicKey);
 
-          // Create recipient ATA if needed (funder pays rent)
-          const recipientAta = await getOrCreateAssociatedTokenAccount(
-            connection, authority, mint, dest, false, 'confirmed', {}, tokenProgram
-          );
+          // Compute recipient ATA address
+          const recipientAta = getAssociatedTokenAddressSync(mint, dest, false, tokenProgram);
 
+          // Create ATA (idempotent — no-op if exists) + transfer in one tx
           const tx = new Transaction().add(
+            createAssociatedTokenAccountIdempotentInstruction(
+              authority.publicKey,
+              recipientAta,
+              dest,
+              mint,
+              tokenProgram
+            ),
             createTransferCheckedInstruction(
               senderAta,
               mint,
-              recipientAta.address,
+              recipientAta,
               authority.publicKey,
               rawAmount,
               decimals,
@@ -106,9 +115,10 @@ export async function POST(request: Request) {
           const sig = await connection.sendTransaction(tx, [authority], { skipPreflight: false });
           await connection.confirmTransaction(sig, 'confirmed');
           sigList.push(sig);
+          console.log(`[distribute] ✓ ${w.publicKey.slice(0, 8)}... ${amt} sent (${sigList.length}/${wallets.length})`);
 
-          // Small delay to avoid rate limiting
-          await new Promise(r => setTimeout(r, 300));
+          // Delay to avoid rate limiting (500ms + jitter)
+          await new Promise(r => setTimeout(r, 500 + Math.random() * 300));
         } catch (walletErr) {
           console.error(`Transfer failed for wallet ${w.publicKey}:`, walletErr);
           errors.push({ wallet: w.publicKey, error: (walletErr as Error).message });
@@ -125,7 +135,7 @@ export async function POST(request: Request) {
 
     return NextResponse.json({
       success: true,
-      data: { signatures, mode: distributionMode, count: signatures.length },
+      data: { signatures, mode: distributionMode, count: signatures.length, errors: errors.length > 0 ? errors : undefined },
     });
   } catch (err) {
     console.error('Distribute tokens error:', err);
