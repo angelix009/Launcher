@@ -53,6 +53,16 @@ next-env.d.ts
 *wallet*.json
 *keypair*.json
 *secret*.json
+GRTfXWmDTseayW2dS688GkZpZFcC7wQ2PGnaqZ6YQEmo.json
+RoARruzbesVGAZgCzSoQCEdyVWytvzLbyNaxXBF7dnF.json
+iRTXNKLbt9ojybsGx1CJpdM4Ze6ErWVQX1A8cUc3MYx.json
+pool-analysis.txt
+
+# stealth recovery data
+.stealth-recovery/
+
+# claude
+.claude/
 
 # IDE
 .vscode/

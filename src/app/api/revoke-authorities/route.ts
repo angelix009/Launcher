@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { PublicKey } from '@solana/web3.js';
 import { getConnection, keypairFromPrivateKey } from '@/lib/solana';
 import { revokeAuthorities } from '@/lib/token';
+import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
 
 export async function POST(request: Request) {
   try {
@@ -39,12 +40,17 @@ export async function POST(request: Request) {
     const authority = keypairFromPrivateKey(privateKey);
     const mint = new PublicKey(tokenMint);
 
+    // Auto-detect if token is SPL standard or Token-2022
+    const accountInfo = await connection.getAccountInfo(mint);
+    const isSPL = accountInfo?.owner.equals(TOKEN_PROGRAM_ID) ?? false;
+
     const signature = await revokeAuthorities(
       connection,
       authority,
       mint,
       revokeMint ?? true,
-      revokeUpdate ?? false
+      revokeUpdate ?? false,
+      isSPL
     );
 
     return NextResponse.json({

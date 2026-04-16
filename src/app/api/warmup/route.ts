@@ -172,7 +172,7 @@ export async function POST(request: Request) {
     // Assign different tokens to each wallet
     const results: {
       wallet: string;
-      trades: { token: string; buyTx?: string; sellTx?: string; error?: string }[];
+      trades: { token: string; buyTx?: string; sellTx?: string; rentRecovered?: boolean; error?: string }[];
     }[] = [];
 
     // Shuffle tokens and deal them out
@@ -237,7 +237,7 @@ export async function POST(request: Request) {
             tokenProgramId = TOKEN_2022_PROGRAM_ID;
           }
 
-          if (tokenBalance > 0n) {
+          if (tokenBalance > BigInt(0)) {
             console.log(`[warmup] ${w.publicKey.slice(0, 8)}... SELL ${tokenBalance} ${tokenMint.slice(0, 8)}... → SOL`);
             trade.sellTx = await jupiterSwap(
               connection, keypair, tokenMint, SOL_MINT, Number(tokenBalance)

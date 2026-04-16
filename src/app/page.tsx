@@ -12,6 +12,8 @@ import SellStrategy from '@/components/SellStrategy';
 import RevokeAuthorities from '@/components/RevokeAuthorities';
 import MarketMaking from '@/components/MarketMaking';
 import AlphaVaultLauncher from '@/components/AlphaVaultLauncher';
+import EditMetadata from '@/components/EditMetadata';
+import StealthFund from '@/components/StealthFund';
 import type { AppModule, WalletEntry, TransactionLog, TokenResult, PoolResult } from '@/types';
 import { v4 as uuidv4 } from 'uuid';
 import { ChevronDown, Coins, Droplets, Loader2, RefreshCw } from 'lucide-react';
@@ -324,6 +326,38 @@ export default function Home() {
             network={network}
             onTokenCreated={handleTokenCreated}
             creatorKey={creatorKey}
+          />
+        );
+      case 'edit-metadata':
+        return (
+          <EditMetadata
+            privateKey={creatorKey}
+            tokenMint={tokenMint}
+            network={network}
+            onAddLog={addLog}
+          />
+        );
+      case 'stealth-fund':
+        return (
+          <StealthFund
+            wallets={wallets}
+            network={network}
+            onAddLog={addLog}
+            onRefreshBalances={async () => {
+              // Trigger wallet balance refresh
+              const res = await fetch('/api/wallets/balances', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ wallets, network, tokenMint }),
+              });
+              const data = await res.json();
+              if (data.success && data.data) {
+                setWallets(prev => prev.map(w => {
+                  const updated = data.data.find((u: { id: string }) => u.id === w.id);
+                  return updated ? { ...w, ...updated } : w;
+                }));
+              }
+            }}
           />
         );
       case 'wallets':

@@ -56,6 +56,7 @@ export default function PoolCreator({
   const [useDynamicFee, setUseDynamicFee] = useState(true);
   const [collectFeeMode, setCollectFeeMode] = useState(1);
   const [hasAlphaVault, setHasAlphaVault] = useState(false);
+  const [configAddress, setConfigAddress] = useState('');
   const [maxPrice, setMaxPrice] = useState('');
   const [manualInitPrice, setManualInitPrice] = useState('');
   const [targetMcapUsd, setTargetMcapUsd] = useState('');
@@ -177,6 +178,7 @@ export default function PoolCreator({
           activationDelay,
           hasAlphaVault,
           network,
+          ...(configAddress.trim() ? { configAddress: configAddress.trim() } : {}),
         }),
       });
 
@@ -726,6 +728,19 @@ export default function PoolCreator({
                 <span className="text-sm text-white font-medium">Enable Alpha Vault</span>
                 <p className="text-xs text-[#52525b]">Required to create an Alpha Vault on this pool for fair token distribution</p>
               </div>
+            </div>
+
+            {/* Config Address (for creating second pool with same mints) */}
+            <div className="mt-4">
+              <label className="text-sm text-[#a1a1aa] mb-1 block">Config Address (optional)</label>
+              <input
+                type="text"
+                value={configAddress}
+                onChange={(e) => setConfigAddress(e.target.value)}
+                placeholder="Meteora config PDA (for 2nd pool with same mints)"
+                className="w-full bg-[#09090b] border border-[#27272a] rounded-lg px-3 py-2 text-white text-sm"
+              />
+              <p className="text-xs text-[#52525b] mt-1">Use if custom pool already exists for this mint pair. GNWR used: EQbqYxecZuJsVt6g5QbKTWpNWa3QyWQE5NWz5AZBAiNv</p>
             </div>
           </div>
         </div>

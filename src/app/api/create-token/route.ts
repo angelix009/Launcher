@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { getConnection, keypairFromPrivateKey } from '@/lib/solana';
-import { createToken2022 } from '@/lib/token';
+import { createToken2022, createTokenSPL } from '@/lib/token';
 import type { TokenConfig } from '@/types';
 
 export async function POST(request: Request) {
@@ -20,6 +20,8 @@ export async function POST(request: Request) {
       network,
       vanityPrefix,
       vanitySuffix,
+      vanityKeypair,
+      tokenStandard,
     } = body;
 
     if (!privateKey || !name || !symbol) {
@@ -44,9 +46,13 @@ export async function POST(request: Request) {
       network: network || 'devnet',
       vanityPrefix: vanityPrefix || '',
       vanitySuffix: vanitySuffix || '',
+      vanityKeypair: vanityKeypair || undefined,
+      tokenStandard: tokenStandard || 'token-2022',
     };
 
-    const result = await createToken2022(connection, payer, config);
+    const result = config.tokenStandard === 'spl'
+      ? await createTokenSPL(connection, payer, config)
+      : await createToken2022(connection, payer, config);
 
     return NextResponse.json({ success: true, data: result });
   } catch (err) {

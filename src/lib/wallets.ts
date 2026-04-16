@@ -174,12 +174,17 @@ export async function distributeTokens(
   wallets: WalletEntry[],
   amountPerWallet: number
 ): Promise<string[]> {
+  // Auto-detect token program
+  const { TOKEN_PROGRAM_ID } = await import('@solana/spl-token');
+  const mintAccountInfo = await connection.getAccountInfo(tokenMint);
+  const tokenProgram = mintAccountInfo?.owner.equals(TOKEN_PROGRAM_ID) ? TOKEN_PROGRAM_ID : TOKEN_2022_PROGRAM_ID;
+
   const signatures: string[] = [];
   const senderATA = getAssociatedTokenAddressSync(
     tokenMint,
     sender.publicKey,
     false,
-    TOKEN_2022_PROGRAM_ID
+    tokenProgram
   );
 
   for (let i = 0; i < wallets.length; i += 5) {
@@ -195,7 +200,7 @@ export async function distributeTokens(
         tokenMint,
         recipientPub,
         false,
-        TOKEN_2022_PROGRAM_ID
+        tokenProgram
       );
 
       // Create ATA if needed
@@ -205,7 +210,7 @@ export async function distributeTokens(
           recipientATA,
           recipientPub,
           tokenMint,
-          TOKEN_2022_PROGRAM_ID
+          tokenProgram
         )
       );
 
@@ -220,7 +225,7 @@ export async function distributeTokens(
           rawAmount,
           decimals,
           [],
-          TOKEN_2022_PROGRAM_ID
+          tokenProgram
         )
       );
     }
@@ -253,6 +258,11 @@ export async function mintToWallets(
   amountPerWallet: number,
   perWalletAmounts?: Record<string, number>
 ): Promise<string[]> {
+  // Auto-detect token program
+  const { TOKEN_PROGRAM_ID } = await import('@solana/spl-token');
+  const mintAccountInfo = await connection.getAccountInfo(tokenMint);
+  const tokenProgram = mintAccountInfo?.owner.equals(TOKEN_PROGRAM_ID) ? TOKEN_PROGRAM_ID : TOKEN_2022_PROGRAM_ID;
+
   const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
 
   // Build and sign all txs upfront — 5 wallets per tx
@@ -269,13 +279,13 @@ export async function mintToWallets(
 
       const recipientPub = new PublicKey(w.publicKey);
       const recipientATA = getAssociatedTokenAddressSync(
-        tokenMint, recipientPub, false, TOKEN_2022_PROGRAM_ID
+        tokenMint, recipientPub, false, tokenProgram
       );
 
       tx.add(
         createAssociatedTokenAccountIdempotentInstruction(
           mintAuthority.publicKey, recipientATA, recipientPub,
-          tokenMint, TOKEN_2022_PROGRAM_ID
+          tokenMint, tokenProgram
         )
       );
 
@@ -283,7 +293,7 @@ export async function mintToWallets(
       tx.add(
         createMintToInstruction(
           tokenMint, recipientATA, mintAuthority.publicKey,
-          rawAmount, [], TOKEN_2022_PROGRAM_ID
+          rawAmount, [], tokenProgram
         )
       );
       hasInstructions = true;
@@ -360,13 +370,19 @@ export async function getWalletBalances(
       : 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
   );
 
-  // Fetch token decimals once if we have a mint
+  // Fetch token decimals and detect program (SPL vs Token-2022)
   let tokenDecimals = 6;
+  let tokenProgramId = TOKEN_2022_PROGRAM_ID;
   if (tokenMint) {
     try {
-      const { getMint } = await import('@solana/spl-token');
+      const { getMint, TOKEN_PROGRAM_ID } = await import('@solana/spl-token');
       const mintPub = new PublicKey(tokenMint);
-      const mintInfo = await getMint(connection, mintPub, 'confirmed', TOKEN_2022_PROGRAM_ID);
+      // Auto-detect token program
+      const mintAccountInfo = await connection.getAccountInfo(mintPub);
+      if (mintAccountInfo) {
+        tokenProgramId = mintAccountInfo.owner.equals(TOKEN_PROGRAM_ID) ? TOKEN_PROGRAM_ID : TOKEN_2022_PROGRAM_ID;
+      }
+      const mintInfo = await getMint(connection, mintPub, 'confirmed', tokenProgramId);
       tokenDecimals = mintInfo.decimals;
     } catch {
       // fallback to 6
@@ -378,7 +394,7 @@ export async function getWalletBalances(
   const walletPubkeys = wallets.map(w => new PublicKey(w.publicKey));
   const tokenATAs = tokenMint
     ? walletPubkeys.map(pub =>
-        getAssociatedTokenAddressSync(new PublicKey(tokenMint), pub, false, TOKEN_2022_PROGRAM_ID)
+        getAssociatedTokenAddressSync(new PublicKey(tokenMint), pub, false, tokenProgramId)
       )
     : [];
   const usdcATAs = walletPubkeys.map(pub =>

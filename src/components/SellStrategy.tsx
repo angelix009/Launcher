@@ -106,6 +106,7 @@ export default function SellStrategy({
   const [quickTradeMode, setQuickTradeMode] = useState(true);
   const [quickTradeSlippage, setQuickTradeSlippage] = useState(30);
   const [customQuickSellPct, setCustomQuickSellPct] = useState<Record<string, string>>({});
+  const [customQuickSellAmt, setCustomQuickSellAmt] = useState<Record<string, string>>({});
   const [customBuyAmount, setCustomBuyAmount] = useState<Record<string, string>>({});
   const [walletActionLoading, setWalletActionLoading] = useState<Map<string, string>>(new Map());
   const [pricePerToken, setPricePerToken] = useState<number>(0);
@@ -2200,28 +2201,38 @@ export default function SellStrategy({
                           <TrendingDown className="w-3.5 h-3.5 text-orange-400" />
                           <span className="text-xs text-orange-400 font-medium uppercase tracking-wider">Sell</span>
                         </div>
-                        <div className="flex items-center gap-1.5 flex-wrap">
+                        <div className="flex items-start gap-1.5">
                           {quickSellPresets.map((pct) => {
                             const isActive = busy && activeAction === `sell-${pct}`;
                             return (
-                              <button
-                                key={pct}
-                                onClick={() => handleQuickSell(wallet, pct)}
-                                disabled={busy}
-                                className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-all border ${
-                                  isActive
-                                    ? 'bg-orange-500 text-white border-orange-500'
-                                    : 'bg-[#09090b] text-[#a1a1aa] border-[#27272a] hover:border-orange-500/50 hover:text-orange-400 disabled:opacity-40 disabled:cursor-not-allowed'
-                                }`}
-                              >
-                                {isActive ? (
-                                  <Loader2 className="w-3 h-3 animate-spin inline" />
-                                ) : (
-                                  `${pct}%`
-                                )}
-                              </button>
+                              <div key={pct} className="flex flex-col items-center gap-0.5">
+                                <button
+                                  onClick={() => handleQuickSell(wallet, pct)}
+                                  disabled={busy}
+                                  className={`w-[56px] py-1.5 rounded-md text-xs font-semibold transition-all border text-center ${
+                                    isActive
+                                      ? 'bg-orange-500 text-white border-orange-500'
+                                      : 'bg-[#09090b] text-[#a1a1aa] border-[#27272a] hover:border-orange-500/50 hover:text-orange-400 disabled:opacity-40 disabled:cursor-not-allowed'
+                                  }`}
+                                >
+                                  {isActive ? (
+                                    <Loader2 className="w-3 h-3 animate-spin inline" />
+                                  ) : pricePerToken > 0 ? (
+                                    (() => {
+                                      const est = wallet.tokenBalance * (pct / 100) * pricePerToken;
+                                      if (isSolPaired) return est < 0.01 ? `${est.toFixed(4)} SOL` : `${est.toFixed(3)} SOL`;
+                                      return est < 0.01 ? `$${est.toFixed(4)}` : `$${est.toFixed(2)}`;
+                                    })()
+                                  ) : (
+                                    `${pct}%`
+                                  )}
+                                </button>
+                                <span className="text-[10px] text-[#52525b] font-mono">{pct}%</span>
+                              </div>
                             );
                           })}
+                        </div>
+                        <div className="flex items-center gap-3 flex-wrap">
                           {/* Custom sell % */}
                           <div className="flex items-center gap-1">
                             <input
@@ -2252,29 +2263,55 @@ export default function SellStrategy({
                             >
                               {busy && activeAction.startsWith('sell-') && !quickSellPresets.some((p) => activeAction === `sell-${p}`) ? (
                                 <Loader2 className="w-3 h-3 animate-spin" />
+                              ) : (() => {
+                                const val = parseFloat(customQuickSellPct[wallet.id] || '');
+                                if (!isNaN(val) && val > 0 && pricePerToken > 0) {
+                                  const est = wallet.tokenBalance * (val / 100) * pricePerToken;
+                                  if (isSolPaired) return est < 0.01 ? `${est.toFixed(4)} SOL` : `${est.toFixed(3)} SOL`;
+                                  return est < 0.01 ? `$${est.toFixed(4)}` : `$${est.toFixed(2)}`;
+                                }
+                                return 'Go';
+                              })()}
+                            </button>
+                          </div>
+                          {/* Custom sell by $ amount */}
+                          <div className="flex items-center gap-1">
+                            <span className="text-xs text-[#52525b]">$</span>
+                            <input
+                              type="number"
+                              value={customQuickSellAmt[wallet.id] || ''}
+                              onChange={(e) =>
+                                setCustomQuickSellAmt((prev) => ({
+                                  ...prev,
+                                  [wallet.id]: e.target.value,
+                                }))
+                              }
+                              placeholder="amount"
+                              min={0.01}
+                              step={0.01}
+                              disabled={busy || pricePerToken <= 0}
+                              className="w-20 bg-[#09090b] border border-[#27272a] rounded-md px-2 py-1.5 text-white text-xs focus:ring-1 focus:ring-orange-500/50 focus:border-orange-500 outline-none disabled:opacity-40"
+                            />
+                            <button
+                              onClick={() => {
+                                const amt = parseFloat(customQuickSellAmt[wallet.id] || '');
+                                if (!isNaN(amt) && amt > 0 && pricePerToken > 0) {
+                                  const totalValue = wallet.tokenBalance * pricePerToken;
+                                  const pctToSell = Math.min(100, (amt / totalValue) * 100);
+                                  handleQuickSell(wallet, pctToSell);
+                                }
+                              }}
+                              disabled={busy || !customQuickSellAmt[wallet.id] || pricePerToken <= 0}
+                              className="px-2 py-1.5 rounded-md text-xs font-semibold bg-orange-600 text-white hover:bg-orange-500 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                            >
+                              {busy && activeAction.startsWith('sell-') ? (
+                                <Loader2 className="w-3 h-3 animate-spin" />
                               ) : (
-                                'Go'
+                                'Sell'
                               )}
                             </button>
                           </div>
                         </div>
-                        {/* USDC preview row */}
-                        {pricePerToken > 0 && (
-                          <div className="flex items-center gap-1.5 flex-wrap pl-5">
-                            {quickSellPresets.map((pct) => {
-                              const sellTokens = wallet.tokenBalance * (pct / 100);
-                              const estValue = sellTokens * pricePerToken;
-                              return (
-                                <span
-                                  key={pct}
-                                  className="px-3 py-0.5 text-[10px] text-[#52525b] font-mono min-w-[52px] text-center"
-                                >
-                                  ~{estValue < 0.01 ? estValue.toFixed(4) : estValue.toFixed(2)} {priceQuoteSymbol}
-                                </span>
-                              );
-                            })}
-                          </div>
-                        )}
                       </div>
                     )}
 
@@ -2475,7 +2512,14 @@ export default function SellStrategy({
                       : 'bg-[#09090b] text-[#a1a1aa] border-[#27272a] hover:border-orange-500/50 hover:text-orange-400'
                   }`}
                 >
-                  {pct}%
+                  <span>{pct}%</span>
+                  {pricePerToken > 0 && selectedWallets.length > 0 && (
+                    <span className="block text-[10px] font-normal text-[#71717a] mt-0.5">
+                      ~{(selectedWallets.reduce((s, w) => s + w.tokenBalance, 0) * (pct / 100) * pricePerToken).toFixed(
+                        priceQuoteSymbol === 'USDC' ? 2 : 4
+                      )} {priceQuoteSymbol}
+                    </span>
+                  )}
                 </button>
               ))}
             </div>

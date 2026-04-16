@@ -18,6 +18,14 @@ import {
 import bs58 from 'bs58';
 import type { WalletEntry, BuyResult } from '@/types';
 
+const SPL_TOKEN_PROGRAM = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+
+/** Detect if a token mint uses SPL standard or Token-2022 */
+async function detectTokenProgram(connection: Connection, mint: PublicKey): Promise<PublicKey> {
+  const info = await connection.getAccountInfo(mint);
+  return info?.owner.equals(SPL_TOKEN_PROGRAM) ? SPL_TOKEN_PROGRAM : TOKEN_2022_PROGRAM_ID;
+}
+
 export interface SellResult {
   walletId: string;
   walletPublicKey: string;
@@ -51,6 +59,11 @@ export async function sellTokensFromWallets(
   const results: SellResult[] = [];
   const pool = new PublicKey(poolAddress);
   const mint = new PublicKey(tokenMint);
+
+  // Auto-detect token program (SPL vs Token-2022)
+  const STANDARD_TOKEN = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+  const mintAccountInfo = await connection.getAccountInfo(mint);
+  const tokenProgram = mintAccountInfo?.owner.equals(STANDARD_TOKEN) ? STANDARD_TOKEN : TOKEN_2022_PROGRAM_ID;
 
   // Create CpAmm instance for DAMM v2
   const cpAmm = new CpAmm(connection as any);
@@ -93,12 +106,12 @@ export async function sellTokensFromWallets(
       try {
         const keypair = Keypair.fromSecretKey(bs58.decode(wallet.privateKey));
         const ata = getAssociatedTokenAddressSync(
-          mint, keypair.publicKey, false, TOKEN_2022_PROGRAM_ID
+          mint, keypair.publicKey, false, tokenProgram
         );
 
         let balance: bigint;
         try {
-          const account = await getAccount(connection, ata, 'confirmed', TOKEN_2022_PROGRAM_ID);
+          const account = await getAccount(connection, ata, 'confirmed', tokenProgram);
           balance = account.amount;
         } catch {
           results.push({ walletId: wallet.id, walletPublicKey: wallet.publicKey, error: 'No token account found', amountSold: 0 });
@@ -269,6 +282,7 @@ export async function getQuoteForWallets(
   const results: QuoteResult[] = [];
   const pool = new PublicKey(poolAddress);
   const mint = new PublicKey(tokenMint);
+  const tokenProgram = await detectTokenProgram(connection, mint);
   const cpAmm = new CpAmm(connection as any);
 
   const USDC_MINTS = [
@@ -294,12 +308,12 @@ export async function getQuoteForWallets(
     try {
       const keypair = Keypair.fromSecretKey(bs58.decode(wallet.privateKey));
       const ata = getAssociatedTokenAddressSync(
-        mint, keypair.publicKey, false, TOKEN_2022_PROGRAM_ID
+        mint, keypair.publicKey, false, tokenProgram
       );
 
       let balance: bigint;
       try {
-        const account = await getAccount(connection, ata, 'confirmed', TOKEN_2022_PROGRAM_ID);
+        const account = await getAccount(connection, ata, 'confirmed', tokenProgram);
         balance = account.amount;
       } catch {
         results.push({
@@ -431,19 +445,10 @@ export async function sendTokensBetweenWallets(
   const from = Keypair.fromSecretKey(bs58.decode(fromPrivateKey));
   const to = new PublicKey(toPublicKey);
   const mint = new PublicKey(tokenMint);
+  const tkProg = await detectTokenProgram(connection, mint);
 
-  const fromATA = getAssociatedTokenAddressSync(
-    mint,
-    from.publicKey,
-    false,
-    TOKEN_2022_PROGRAM_ID
-  );
-  const toATA = getAssociatedTokenAddressSync(
-    mint,
-    to,
-    false,
-    TOKEN_2022_PROGRAM_ID
-  );
+  const fromATA = getAssociatedTokenAddressSync(mint, from.publicKey, false, tkProg);
+  const toATA = getAssociatedTokenAddressSync(mint, to, false, tkProg);
 
   const tx = new Transaction();
   tx.add(
@@ -453,27 +458,12 @@ export async function sendTokensBetweenWallets(
   // Create recipient ATA if needed (idempotent: no-op if already exists)
   const { createAssociatedTokenAccountIdempotentInstruction } = await import('@solana/spl-token');
   tx.add(
-    createAssociatedTokenAccountIdempotentInstruction(
-      from.publicKey,
-      toATA,
-      to,
-      mint,
-      TOKEN_2022_PROGRAM_ID
-    )
+    createAssociatedTokenAccountIdempotentInstruction(from.publicKey, toATA, to, mint, tkProg)
   );
 
   const rawAmount = BigInt(Math.floor(amount * 10 ** decimals));
   tx.add(
-    createTransferCheckedInstruction(
-      fromATA,
-      mint,
-      toATA,
-      from.publicKey,
-      rawAmount,
-      decimals,
-      [],
-      TOKEN_2022_PROGRAM_ID
-    )
+    createTransferCheckedInstruction(fromATA, mint, toATA, from.publicKey, rawAmount, decimals, [], tkProg)
   );
 
   const { blockhash } = await connection.getLatestBlockhash();
@@ -694,6 +684,7 @@ export async function sellExactTokenAmount(
 ): Promise<SellResult> {
   const pool = new PublicKey(poolAddress);
   const mint = new PublicKey(tokenMint);
+  const tokenProgram = await detectTokenProgram(connection, mint);
   const cpAmm = new CpAmm(connection as any);
 
   const USDC_MINTS = [
@@ -707,13 +698,13 @@ export async function sellExactTokenAmount(
   try {
     const keypair = Keypair.fromSecretKey(bs58.decode(wallet.privateKey));
     const ata = getAssociatedTokenAddressSync(
-      mint, keypair.publicKey, false, TOKEN_2022_PROGRAM_ID
+      mint, keypair.publicKey, false, tokenProgram
     );
 
     // Get balance and cap if needed
     let balance: bigint;
     try {
-      const account = await getAccount(connection, ata, 'confirmed', TOKEN_2022_PROGRAM_ID);
+      const account = await getAccount(connection, ata, 'confirmed', tokenProgram);
       balance = account.amount;
     } catch {
       return {
@@ -859,10 +850,10 @@ export async function closeTokenAccount(
   const kp = Keypair.fromSecretKey(bs58.decode(walletPrivateKey));
   const mint = new PublicKey(tokenMint);
 
-  // Determine the token program — default to Token 2022 (our typical case)
+  // Auto-detect token program if not provided
   const tokenProgram = tokenProgramId
     ? new PublicKey(tokenProgramId)
-    : T22;
+    : await detectTokenProgram(connection, mint);
 
   const ata = getATA(mint, kp.publicKey, false, tokenProgram);
 
@@ -1078,6 +1069,19 @@ export async function batchSendFromWallets(
   }
 
   // 3b. Build individual txs for non-SOL items (USDC, Token)
+  // Auto-detect token program for the first token item
+  const tokenItems = nonSolItems.filter(i => i.assetType === 'token' && i.tokenMint);
+  let detectedTokenProgram = TOKEN_2022_PROGRAM_ID;
+  if (tokenItems.length > 0) {
+    try {
+      const mintPk = new PublicKey(tokenItems[0].tokenMint!);
+      const mintInfo = await connection.getAccountInfo(mintPk);
+      if (mintInfo?.owner.equals(STANDARD_TOKEN_PROGRAM)) {
+        detectedTokenProgram = STANDARD_TOKEN_PROGRAM;
+      }
+    } catch {}
+  }
+
   for (const item of nonSolItems) {
     const origIdx = items.indexOf(item);
     try {
@@ -1102,11 +1106,11 @@ export async function batchSendFromWallets(
         tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 1_000 }));
         const mint = new PublicKey(item.tokenMint!);
         const decimals = item.decimals ?? 6;
-        const fromATA = getAssociatedTokenAddressSync(mint, sender.publicKey, false, TOKEN_2022_PROGRAM_ID);
-        const toATA = getAssociatedTokenAddressSync(mint, recipient, false, TOKEN_2022_PROGRAM_ID);
-        tx.add(createAssociatedTokenAccountIdempotentInstruction(sender.publicKey, toATA, recipient, mint, TOKEN_2022_PROGRAM_ID));
+        const fromATA = getAssociatedTokenAddressSync(mint, sender.publicKey, false, detectedTokenProgram);
+        const toATA = getAssociatedTokenAddressSync(mint, recipient, false, detectedTokenProgram);
+        tx.add(createAssociatedTokenAccountIdempotentInstruction(sender.publicKey, toATA, recipient, mint, detectedTokenProgram));
         const rawAmount = BigInt(Math.floor(item.amount * 10 ** decimals));
-        tx.add(createTransferCheckedInstruction(fromATA, mint, toATA, sender.publicKey, rawAmount, decimals, [], TOKEN_2022_PROGRAM_ID));
+        tx.add(createTransferCheckedInstruction(fromATA, mint, toATA, sender.publicKey, rawAmount, decimals, [], detectedTokenProgram));
       }
 
       tx.recentBlockhash = blockhash;

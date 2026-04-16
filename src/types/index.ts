@@ -21,6 +21,8 @@ export interface TokenConfig {
   network: 'devnet' | 'mainnet-beta';
   vanityPrefix?: string;
   vanitySuffix?: string;
+  vanityKeypair?: number[]; // Pre-ground keypair from solana-keygen grind
+  tokenStandard?: 'token-2022' | 'spl'; // Default: token-2022
 }
 
 export interface TokenResult {
@@ -49,6 +51,7 @@ export interface PoolConfig {
   activationDelay: number; // seconds for timestamp, slots for slot
   hasAlphaVault: boolean;
   network: 'devnet' | 'mainnet-beta';
+  configAddress?: string; // Meteora config PDA for createPool (used when custom pool already exists)
 }
 
 export interface PoolResult {
@@ -68,12 +71,22 @@ export interface SellConfig {
 
 export interface TransactionLog {
   id: string;
-  type: 'mint' | 'transfer' | 'sell' | 'buy' | 'pool' | 'fund';
+  type: 'mint' | 'transfer' | 'sell' | 'buy' | 'pool' | 'fund' | 'warmup';
   signature: string;
   status: 'success' | 'error' | 'pending';
   message: string;
   timestamp: string;
   details?: Record<string, unknown>;
+}
+
+export interface LogEntry {
+  id: string;
+  timestamp: Date;
+  action: string;
+  status: 'success' | 'error' | 'info';
+  message: string;
+  txSignature?: string;
+  network: string;
 }
 
 export interface MintToWalletsConfig {
@@ -102,4 +115,4 @@ export interface BuyResult {
   quoteSymbol: string;
 }
 
-export type AppModule = 'dashboard' | 'token' | 'wallets' | 'pool' | 'pool-v1' | 'pool-manage' | 'sell' | 'revoke' | 'market-making' | 'alpha-vault';
+export type AppModule = 'dashboard' | 'token' | 'edit-metadata' | 'wallets' | 'stealth-fund' | 'pool' | 'pool-v1' | 'pool-manage' | 'sell' | 'revoke' | 'market-making' | 'alpha-vault';

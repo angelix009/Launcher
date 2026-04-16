@@ -144,7 +144,7 @@ export default function WalletManager({
     })();
   }, [creatorKey]);
 
-  // Auto-refresh balances every 5 seconds
+  // Auto-refresh balances every 30 seconds (manual refresh also available)
   useEffect(() => {
     if (!creatorWallet) return;
     const doRefresh = async () => {
@@ -164,17 +164,24 @@ export default function WalletManager({
         const data = await res.json();
         if (!data.success) return;
         const updated: WalletEntry[] = data.data;
+        // Only update balances that actually changed (don't overwrite with 0 on error)
         const creatorUpdated = updated.find(w => w.id === '__creator__');
         if (creatorUpdated && creatorWalletRef.current) {
           setCreatorWallet(prev => prev ? { ...prev, solBalance: creatorUpdated.solBalance, tokenBalance: creatorUpdated.tokenBalance, usdcBalance: creatorUpdated.usdcBalance } : prev);
         }
-        onWalletsChange(updated.filter(w => w.id !== '__creator__'));
+        const walletUpdates = updated.filter(w => w.id !== '__creator__');
+        // Merge: keep old balances if new ones are all zero (likely RPC error)
+        const hasAnyBalance = walletUpdates.some(w => w.solBalance > 0 || w.tokenBalance > 0 || w.usdcBalance > 0);
+        const oldHasBalance = currentWallets.some(w => w.solBalance > 0 || w.tokenBalance > 0 || w.usdcBalance > 0);
+        if (hasAnyBalance || !oldHasBalance) {
+          onWalletsChange(walletUpdates);
+        }
       } catch {} finally {
         refreshingRef.current = false;
       }
     };
     doRefresh();
-    const interval = setInterval(doRefresh, 5000);
+    const interval = setInterval(doRefresh, 30000);
     return () => clearInterval(interval);
   }, [creatorWallet?.publicKey]);
 

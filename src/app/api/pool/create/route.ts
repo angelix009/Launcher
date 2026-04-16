@@ -58,6 +58,7 @@ export async function POST(request: Request) {
       activationDelay: activationDelay ?? 0,
       hasAlphaVault: hasAlphaVault ?? false,
       network: network || 'devnet',
+      configAddress: body.configAddress || undefined,
     };
 
     console.log('[Pool API] Config:', JSON.stringify({

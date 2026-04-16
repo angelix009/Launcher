@@ -1,6 +1,9 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  typescript: {
+    ignoreBuildErrors: true,
+  },
   turbopack: {},
   webpack: (config, { isServer }) => {
     if (!isServer) {

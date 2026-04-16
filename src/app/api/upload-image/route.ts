@@ -23,7 +23,7 @@ export async function POST(request: Request) {
       );
     }
 
-    // Validate file size (max 20MB for catbox)
+    // Validate file size (max 20MB)
     if (file.size > 20 * 1024 * 1024) {
       return NextResponse.json(
         { success: false, error: 'File too large. Max 20MB.' },
@@ -31,27 +31,28 @@ export async function POST(request: Request) {
       );
     }
 
-    // Upload to catbox.moe
-    const catboxForm = new FormData();
-    catboxForm.append('reqtype', 'fileupload');
-    catboxForm.append('fileToUpload', file);
+    // Upload to Pinata/IPFS
+    const pinataForm = new FormData();
+    pinataForm.append('file', file);
 
-    const res = await fetch('https://catbox.moe/user/api.php', {
+    const res = await fetch('https://api.pinata.cloud/pinning/pinFileToIPFS', {
       method: 'POST',
-      body: catboxForm,
+      headers: {
+        Authorization: `Bearer ${process.env.PINATA_JWT}`,
+      },
+      body: pinataForm,
     });
 
     if (!res.ok) {
-      throw new Error(`Catbox upload failed: ${res.status} ${res.statusText}`);
+      const errText = await res.text();
+      throw new Error(`Pinata upload failed: ${res.status} ${errText}`);
     }
 
-    const url = await res.text();
+    const { IpfsHash } = await res.json();
+    const gateway = process.env.PINATA_GATEWAY || 'irt.mypinata.cloud';
+    const url = `https://${gateway}/ipfs/${IpfsHash}`;
 
-    if (!url.startsWith('https://')) {
-      throw new Error(`Unexpected catbox response: ${url.slice(0, 100)}`);
-    }
-
-    return NextResponse.json({ success: true, data: { url: url.trim() } });
+    return NextResponse.json({ success: true, data: { url } });
   } catch (err) {
     console.error('Image upload error:', err);
     return NextResponse.json(

@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { Flame, Coins, Wallet, Droplets, TrendingDown, LayoutDashboard, Settings2, ShieldOff, Activity, Lock, DollarSign, Loader2, Rocket } from 'lucide-react';
+import { Flame, Coins, Wallet, Droplets, TrendingDown, LayoutDashboard, Settings2, ShieldOff, Activity, Lock, DollarSign, Loader2, Rocket, FileEdit, EyeOff } from 'lucide-react';
 import type { AppModule } from '@/types';
 
 interface SidebarProps {
@@ -15,7 +15,9 @@ interface SidebarProps {
 const modules: { id: AppModule; label: string; icon: typeof Flame }[] = [
   { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { id: 'token', label: 'Create Token', icon: Coins },
+  { id: 'edit-metadata', label: 'Edit Metadata', icon: FileEdit },
   { id: 'wallets', label: 'Wallets', icon: Wallet },
+  { id: 'stealth-fund', label: 'Stealth Fund', icon: EyeOff },
   { id: 'pool', label: 'Create Pool', icon: Droplets },
   { id: 'pool-v1', label: 'Pool V1 + Stake', icon: Lock },
   { id: 'pool-manage', label: 'Manage Pool', icon: Settings2 },

@@ -12,6 +12,7 @@ import {
   getLiquidityDeltaFromAmountA,
   getBaseFeeParams,
   getDynamicFeeParams,
+  derivePoolAddress,
   MIN_SQRT_PRICE,
   MAX_SQRT_PRICE,
 } from '@meteora-ag/cp-amm-sdk';
@@ -217,28 +218,55 @@ export async function createDammV2Pool(
 
   const positionNft = Keypair.generate();
 
-  // Use createCustomPool to specify fees directly
-  // This avoids relying on pre-existing configs with unknown fee settings
-  const { tx: initPoolTx, pool: poolPubkey } = await cpAmm.createCustomPool({
-    payer: creator.publicKey,
-    creator: creator.publicKey,
-    positionNft: positionNft.publicKey,
-    tokenAMint: tokenMint,
-    tokenBMint: quoteMint,
-    tokenAAmount,
-    tokenBAmount,
-    sqrtMinPrice: minSqrtPrice,
-    sqrtMaxPrice: maxSqrtPrice,
-    liquidityDelta,
-    initSqrtPrice: finalInitSqrtPrice,
-    poolFees,
-    hasAlphaVault: config.hasAlphaVault ?? false,
-    activationType,
-    collectFeeMode: config.collectFeeMode,
-    activationPoint,
-    tokenAProgram: baseTokenProgram,
-    tokenBProgram: quoteTokenProgram,
-  });
+  let initPoolTx: any;
+  let poolPubkey: PublicKey;
+
+  if (config.configAddress) {
+    // Use createCustomPoolWithDynamicConfig with a config PDA
+    // This allows multiple pools per mint pair (different config = different pool address)
+    // while keeping custom fee settings
+    const configPk = new PublicKey(config.configAddress);
+    poolPubkey = derivePoolAddress(configPk, tokenMint, quoteMint);
+    initPoolTx = await cpAmm.createPool({
+      payer: creator.publicKey,
+      creator: creator.publicKey,
+      config: configPk,
+      positionNft: positionNft.publicKey,
+      tokenAMint: tokenMint,
+      tokenBMint: quoteMint,
+      tokenAAmount,
+      tokenBAmount,
+      liquidityDelta,
+      initSqrtPrice: finalInitSqrtPrice,
+      activationPoint,
+      tokenAProgram: baseTokenProgram,
+      tokenBProgram: quoteTokenProgram,
+    });
+  } else {
+    // Use createCustomPool (one per mint pair, custom fees)
+    const result = await cpAmm.createCustomPool({
+      payer: creator.publicKey,
+      creator: creator.publicKey,
+      positionNft: positionNft.publicKey,
+      tokenAMint: tokenMint,
+      tokenBMint: quoteMint,
+      tokenAAmount,
+      tokenBAmount,
+      sqrtMinPrice: minSqrtPrice,
+      sqrtMaxPrice: maxSqrtPrice,
+      liquidityDelta,
+      initSqrtPrice: finalInitSqrtPrice,
+      poolFees,
+      hasAlphaVault: config.hasAlphaVault ?? false,
+      activationType,
+      collectFeeMode: config.collectFeeMode,
+      activationPoint,
+      tokenAProgram: baseTokenProgram,
+      tokenBProgram: quoteTokenProgram,
+    });
+    initPoolTx = result.tx;
+    poolPubkey = result.pool;
+  }
 
   // Replace SDK's ATA instructions with our own using correct token programs
   replaceAtaInstructions(

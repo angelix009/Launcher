@@ -39,9 +39,13 @@ export default function TokenCreator({
   const [description, setDescription] = useState('');
   const [imageUrl, setImageUrl] = useState('');
   const [poolAmount, setPoolAmount] = useState(50_000_000);
+  const [tokenStandard, setTokenStandard] = useState<'token-2022' | 'spl'>('token-2022');
   const [revokeFreeze, setRevokeFreeze] = useState(true);
   const [vanityPrefix, setVanityPrefix] = useState('');
   const [vanitySuffix, setVanitySuffix] = useState('');
+  const [vanityKeypair, setVanityKeypair] = useState<number[] | null>(null);
+  const [vanityAddress, setVanityAddress] = useState('');
+  const vanityFileRef = useRef<HTMLInputElement>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<TokenResult | null>(null);
@@ -119,8 +123,10 @@ export default function TokenCreator({
           imageUrl: imageUrl.trim(),
           revokeFreeze,
           network,
-          vanityPrefix: vanityPrefix.trim(),
-          vanitySuffix: vanitySuffix.trim(),
+          vanityPrefix: vanityKeypair ? '' : vanityPrefix.trim(),
+          vanitySuffix: vanityKeypair ? '' : vanitySuffix.trim(),
+          vanityKeypair: vanityKeypair || undefined,
+          tokenStandard,
         }),
       });
 
@@ -145,7 +151,9 @@ export default function TokenCreator({
       <div>
         <h2 className="text-2xl font-bold text-white">Create Token</h2>
         <p className="text-sm text-[#a1a1aa] mt-1">
-          Launch a Solana Token 2022 (Token Extensions) token with metadata
+          {tokenStandard === 'spl'
+            ? 'Launch a standard SPL token with Metaplex metadata'
+            : 'Launch a Solana Token 2022 (Token Extensions) token with metadata'}
         </p>
       </div>
 
@@ -200,6 +208,40 @@ export default function TokenCreator({
               authority.
             </p>
           </div>
+        </div>
+
+        {/* Token Standard */}
+        <div className="bg-[#18181b] rounded-xl border border-[#27272a] p-4">
+          <label className="text-sm text-[#a1a1aa] font-medium mb-2 block">Token Standard</label>
+          <div className="flex rounded-lg overflow-hidden border border-[#27272a]">
+            <button
+              type="button"
+              onClick={() => setTokenStandard('spl')}
+              className={`flex-1 py-2.5 text-sm font-medium transition-colors ${
+                tokenStandard === 'spl'
+                  ? 'bg-green-500/20 text-green-400'
+                  : 'bg-[#09090b] text-[#71717a] hover:text-white'
+              }`}
+            >
+              SPL Token (Standard)
+            </button>
+            <button
+              type="button"
+              onClick={() => setTokenStandard('token-2022')}
+              className={`flex-1 py-2.5 text-sm font-medium transition-colors ${
+                tokenStandard === 'token-2022'
+                  ? 'bg-purple-500/20 text-purple-400'
+                  : 'bg-[#09090b] text-[#71717a] hover:text-white'
+              }`}
+            >
+              Token 2022 (Extensions)
+            </button>
+          </div>
+          <p className="text-[10px] text-[#52525b] mt-1.5">
+            {tokenStandard === 'spl'
+              ? 'Standard SPL token + Metaplex metadata. Compatible with all DEXs and wallets. Used by most tokens.'
+              : 'Token 2022 with on-chain metadata extension. Supports transfer fees, but some DEXs may not support it.'}
+          </p>
         </div>
 
         {/* Token Details */}
@@ -320,8 +362,57 @@ export default function TokenCreator({
               </div>
             </div>
             <p className="text-xs text-[#52525b] mt-1.5">
-              Base58 chars only. 1-2 chars = instant, 3 chars = seconds, 4 chars = may take minutes. Leave empty for random.
+              Base58 chars only. 1-2 chars = instant, 3 chars = seconds, 4+ chars = use Import below.
             </p>
+
+            <div className="mt-3 pt-3 border-t border-[#27272a]">
+              <label className="block text-xs text-[#71717a] mb-1">Or import pre-ground keypair (from <code className="text-purple-400">solana-keygen grind</code>)</label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="file"
+                  ref={vanityFileRef}
+                  accept=".json"
+                  className="hidden"
+                  onChange={async (e) => {
+                    const file = e.target.files?.[0];
+                    if (!file) return;
+                    try {
+                      const text = await file.text();
+                      const arr = JSON.parse(text);
+                      if (!Array.isArray(arr) || arr.length !== 64) throw new Error('Invalid keypair');
+                      const { Keypair } = await import('@solana/web3.js');
+                      const kp = Keypair.fromSecretKey(Uint8Array.from(arr));
+                      setVanityKeypair(arr);
+                      setVanityAddress(kp.publicKey.toBase58());
+                      setVanityPrefix('');
+                      setVanitySuffix('');
+                    } catch (err) {
+                      setError('Invalid keypair file: ' + (err as Error).message);
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={() => vanityFileRef.current?.click()}
+                  className="bg-[#18181b] border border-[#27272a] hover:border-purple-500/50 text-[#a1a1aa] hover:text-white rounded-lg px-3 py-2 text-sm transition-all flex items-center gap-1.5"
+                >
+                  <Upload className="w-3.5 h-3.5" />
+                  Import JSON
+                </button>
+                {vanityAddress && (
+                  <span className="text-xs text-green-400 font-mono">{vanityAddress.slice(0, 12)}...{vanityAddress.slice(-4)}</span>
+                )}
+                {vanityKeypair && (
+                  <button
+                    type="button"
+                    onClick={() => { setVanityKeypair(null); setVanityAddress(''); }}
+                    className="text-xs text-red-400 hover:text-red-300"
+                  >
+                    Clear
+                  </button>
+                )}
+              </div>
+            </div>
           </div>
         </div>
 
@@ -399,7 +490,7 @@ export default function TokenCreator({
                 </div>
               )}
               <p className="text-xs text-[#52525b] mt-1.5">
-                Enter a URL or upload from your computer (PNG, JPG, WebP, SVG). Uploaded images are hosted on catbox.moe.
+                Enter a URL or upload from your computer (PNG, JPG, WebP, SVG). Uploaded images are hosted on IPFS via Pinata.
               </p>
             </div>
           </div>
@@ -507,7 +598,7 @@ export default function TokenCreator({
           ) : (
             <>
               <Coins className="w-5 h-5" />
-              Create Token 2022
+              {tokenStandard === 'spl' ? 'Create SPL Token' : 'Create Token 2022'}
             </>
           )}
         </button>
