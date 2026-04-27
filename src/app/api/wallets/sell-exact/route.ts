@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { getConnection } from '@/lib/solana';
+import { getPoolInfo, isRaydiumPool, getQuoteMint } from '@/lib/pool-utils';
 import type { WalletEntry } from '@/types';
 
 export const dynamic = 'force-dynamic';
@@ -34,17 +35,17 @@ export async function POST(request: Request) {
     }
 
     const connection = getConnection(network || 'devnet');
+    const poolInfo = await getPoolInfo(connection, poolAddress);
 
-    const { sellExactTokenAmount } = await import('@/lib/sell');
-    const result = await sellExactTokenAmount(
-      connection,
-      poolAddress,
-      tokenMint,
-      wallet,
-      tokenAmount,
-      slippage ?? 100,
-      decimals ?? 6
-    );
+    let result;
+    if (isRaydiumPool(poolInfo.type)) {
+      const { sellViaRaydium } = await import('@/lib/sell');
+      const quoteMint = getQuoteMint(poolInfo, tokenMint);
+      result = await sellViaRaydium(connection, poolAddress, poolInfo.type, tokenMint, quoteMint, wallet, tokenAmount, slippage ?? 100, decimals ?? 6);
+    } else {
+      const { sellExactTokenAmount } = await import('@/lib/sell');
+      result = await sellExactTokenAmount(connection, poolAddress, tokenMint, wallet, tokenAmount, slippage ?? 100, decimals ?? 6);
+    }
 
     return NextResponse.json({ success: true, data: result });
   } catch (err) {

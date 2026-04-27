@@ -49,7 +49,7 @@ export async function POST(request: Request) {
     }
 
     const { IpfsHash } = await res.json();
-    const gateway = process.env.PINATA_GATEWAY || 'irt.mypinata.cloud';
+    const gateway = process.env.PINATA_GATEWAY || 'goal.mypinata.cloud';
     const url = `https://${gateway}/ipfs/${IpfsHash}`;
 
     return NextResponse.json({ success: true, data: { url } });

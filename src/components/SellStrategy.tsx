@@ -189,6 +189,34 @@ export default function SellStrategy({
   const autoSellIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const autoSellQuoteDecimalsRef = useRef(9);
   const autoSellQuoteSymbolRef = useRef('SOL');
+
+  // Chart Manager state
+  const [cmEnabled, setCmEnabled] = useState(false);
+  const [cmSellOnBuy, setCmSellOnBuy] = useState(true);
+  const [cmBuyOnSell, setCmBuyOnSell] = useState(false);
+  const [cmMinDollar, setCmMinDollar] = useState(40);
+  const [cmSlippage, setCmSlippage] = useState(5000); // bps
+  const [cmPollMs, setCmPollMs] = useState(3000);
+  const [cmLog, setCmLog] = useState<Array<{
+    id: string;
+    type: 'external-buy' | 'external-sell' | 'counter-sell' | 'counter-buy' | 'error' | 'skip';
+    tokenAmount: number;
+    dollarAmount: number;
+    signature: string;
+    counterSignature?: string;
+    wallet?: string;
+    message: string;
+    timestamp: string;
+  }>>([]);
+  const cmActiveRef = useRef(false);
+  const cmLastSigRef = useRef<string | null>(null);
+  const cmIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const cmProcessingRef = useRef(false);
+  const cmOwnSignaturesRef = useRef<Set<string>>(new Set());
+  const wsRef = useRef<WebSocket | null>(null);
+  const wsConnectedRef = useRef(false);
+  const balanceFallbackRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   const csvInputRef = useRef<HTMLInputElement>(null);
 
   const handleImportCSV = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -547,15 +575,6 @@ export default function SellStrategy({
     }
   };
 
-  // Auto-refresh balances every 5 seconds
-  useEffect(() => {
-    if (wallets.length === 0) return;
-    const interval = setInterval(() => {
-      handleRefreshBalances();
-    }, 5000);
-    return () => clearInterval(interval);
-  }, [wallets.length > 0, tokenMintInput, network]);
-
   // Refresh creator balance
   const refreshCreatorBal = useCallback(async () => {
     if (!creatorKey || creatorKey.length < 30) return;
@@ -580,10 +599,113 @@ export default function SellStrategy({
     } catch {}
   }, [creatorKey, tokenMintInput, network]);
 
+  // Unified WebSocket: wallet balance updates + pool monitoring (Chart Manager)
+  useEffect(() => {
+    const pubkeys = wallets.map(w => w.publicKey);
+    if (pubkeys.length === 0) return;
+
+    const rpcUrl = process.env.NEXT_PUBLIC_RPC_URL || '';
+    const wsUrl = rpcUrl.replace('https://', 'wss://').replace('http://', 'ws://');
+    if (!wsUrl) {
+      // No WS URL — pure polling fallback
+      const iv = setInterval(() => { handleRefreshBalances(); }, 5000);
+      balanceFallbackRef.current = iv;
+      return () => clearInterval(iv);
+    }
+
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let alive = true;
+
+    // Initial fetch
+    handleRefreshBalances();
+    refreshCreatorBal();
+
+    const startFallback = () => {
+      if (!balanceFallbackRef.current && alive) {
+        balanceFallbackRef.current = setInterval(() => { handleRefreshBalances(); }, 5000);
+      }
+    };
+
+    const stopFallback = () => {
+      if (balanceFallbackRef.current) { clearInterval(balanceFallbackRef.current); balanceFallbackRef.current = null; }
+    };
+
+    const connect = () => {
+      if (!alive) return;
+      try {
+        const ws = new WebSocket(wsUrl);
+        wsRef.current = ws;
+
+        ws.onopen = () => {
+          wsConnectedRef.current = true;
+          stopFallback();
+          // Sub 1: wallet transactions (balance refresh trigger)
+          ws.send(JSON.stringify({
+            jsonrpc: '2.0', id: 1, method: 'transactionSubscribe',
+            params: [{ accountInclude: pubkeys }, { commitment: 'confirmed', transactionDetails: 'none' }],
+          }));
+          // Sub 2: pool logs (Chart Manager trigger) — only if pool is set
+          if (poolAddressInput?.trim()) {
+            ws.send(JSON.stringify({
+              jsonrpc: '2.0', id: 2, method: 'logsSubscribe',
+              params: [{ mentions: [poolAddressInput.trim()] }, { commitment: 'confirmed' }],
+            }));
+          }
+          console.log('[WS] Connected — subscribed to', pubkeys.length, 'wallets' + (poolAddressInput ? ' + pool' : ''));
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const msg = JSON.parse(event.data);
+            if (msg.method === 'transactionNotification') {
+              handleRefreshBalances();
+              refreshCreatorBal();
+            } else if (msg.method === 'logsNotification' && msg.params?.result?.value) {
+              if (!msg.params.result.value.err) {
+                // Pool activity — Chart Manager will pick it up via its own polling trigger
+                if (cmActiveRef.current) {
+                  const cmEvent = new CustomEvent('cm-pool-activity');
+                  window.dispatchEvent(cmEvent);
+                }
+              }
+            }
+          } catch {}
+        };
+
+        ws.onclose = () => {
+          wsConnectedRef.current = false;
+          wsRef.current = null;
+          if (alive) {
+            console.log('[WS] Closed — fallback polling');
+            startFallback();
+            reconnectTimer = setTimeout(connect, 5000);
+          }
+        };
+
+        ws.onerror = () => ws.close();
+      } catch {
+        startFallback();
+        reconnectTimer = setTimeout(connect, 5000);
+      }
+    };
+
+    connect();
+    // Start fallback until WS connects
+    startFallback();
+
+    return () => {
+      alive = false;
+      stopFallback();
+      if (wsRef.current) { wsRef.current.close(); wsRef.current = null; }
+      wsConnectedRef.current = false;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+    };
+  }, [wallets.length > 0, tokenMintInput, network, poolAddressInput]);
+
   useEffect(() => {
     if (!creatorKey) return;
     refreshCreatorBal();
-    const iv = setInterval(refreshCreatorBal, 10000);
+    const iv = setInterval(refreshCreatorBal, 30000);
     return () => clearInterval(iv);
   }, [creatorKey, refreshCreatorBal]);
 
@@ -1036,6 +1158,106 @@ export default function SellStrategy({
       }
     };
   }, [autoSellEnabled, quickTradeMode, poolAddressInput, tokenMintInput, network, autoSellPollMs, processAutoSellQueue]);
+
+  // Chart Manager — triggered by unified WebSocket + fallback polling
+  useEffect(() => {
+    if (!cmEnabled) {
+      cmActiveRef.current = false;
+      if (cmIntervalRef.current) { clearInterval(cmIntervalRef.current); cmIntervalRef.current = null; }
+      cmLastSigRef.current = null;
+      return;
+    }
+
+    if (!poolAddressInput || !tokenMintInput) return;
+
+    cmActiveRef.current = true;
+    const cmMode = cmSellOnBuy && cmBuyOnSell ? 'both' : cmSellOnBuy ? 'sell-on-buy' : 'buy-on-sell';
+
+    const pollChartManager = async () => {
+      if (!cmActiveRef.current || cmProcessingRef.current) return;
+      cmProcessingRef.current = true;
+
+      try {
+        const currentWallets = walletsRef.current;
+        const ownPubkeys = currentWallets.map(w => w.publicKey);
+        if (creatorKey) ownPubkeys.push(creatorKey);
+
+        const sellWalletsData = currentWallets
+          .filter(w => w.tokenBalance > 0)
+          .map(w => ({
+            id: w.id, publicKey: w.publicKey, privateKey: w.privateKey,
+            solBalance: w.solBalance, tokenBalance: w.tokenBalance,
+            usdcBalance: w.usdcBalance, label: w.label, createdAt: w.createdAt,
+          }));
+
+        const buyWalletsData = currentWallets
+          .filter(w => w.usdcBalance >= cmMinDollar)
+          .sort((a, b) => b.usdcBalance - a.usdcBalance)
+          .map(w => ({
+            id: w.id, publicKey: w.publicKey, privateKey: w.privateKey,
+            solBalance: w.solBalance, tokenBalance: w.tokenBalance,
+            usdcBalance: w.usdcBalance, label: w.label, createdAt: w.createdAt,
+          }));
+
+        const res = await fetch('/api/chart-manager/poll', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            poolAddress: poolAddressInput.trim(),
+            tokenMint: tokenMintInput.trim(),
+            ownWallets: ownPubkeys,
+            ownSignatures: [...cmOwnSignaturesRef.current],
+            lastSignature: cmLastSigRef.current,
+            minDollar: cmMinDollar,
+            mode: cmMode,
+            sellWallets: sellWalletsData,
+            buyWallets: buyWalletsData,
+            slippageBps: cmSlippage,
+            tokenDecimals,
+            network,
+          }),
+        });
+
+        const data = await res.json();
+        if (data.success && data.data) {
+          if (data.data.lastSignature) {
+            cmLastSigRef.current = data.data.lastSignature;
+          }
+          if (data.data.events && data.data.events.length > 0) {
+            setCmLog(prev => [...data.data.events, ...prev].slice(0, 200));
+            for (const evt of data.data.events) {
+              if (evt.counterSignature) cmOwnSignaturesRef.current.add(evt.counterSignature);
+              if (evt.type === 'counter-sell') addToast(`Chart Manager: sold ${evt.tokenAmount.toLocaleString()} tokens`, 'success');
+              else if (evt.type === 'counter-buy') addToast(`Chart Manager: bought ${evt.tokenAmount.toLocaleString()} tokens`, 'success');
+              else if (evt.type === 'error') addToast(`Chart Manager: ${evt.message}`, 'error');
+            }
+          }
+        }
+      } catch {
+        // Skip failed poll
+      } finally {
+        cmProcessingRef.current = false;
+      }
+    };
+
+    // Listen for pool activity from unified WebSocket
+    const onPoolActivity = () => pollChartManager();
+    window.addEventListener('cm-pool-activity', onPoolActivity);
+
+    // Initial poll to set baseline
+    pollChartManager();
+
+    // Fallback polling if WebSocket not connected
+    if (!wsConnectedRef.current) {
+      cmIntervalRef.current = setInterval(pollChartManager, cmPollMs);
+    }
+
+    return () => {
+      cmActiveRef.current = false;
+      window.removeEventListener('cm-pool-activity', onPoolActivity);
+      if (cmIntervalRef.current) { clearInterval(cmIntervalRef.current); cmIntervalRef.current = null; }
+    };
+  }, [cmEnabled, cmSellOnBuy, cmBuyOnSell, cmMinDollar, cmSlippage, cmPollMs, poolAddressInput, tokenMintInput, network, tokenDecimals, addToast, creatorKey]);
 
   // Quick sell for a single wallet
   const handleQuickSell = useCallback(async (wallet: WalletEntry, pct: number) => {
@@ -1532,6 +1754,242 @@ export default function SellStrategy({
                           <span className="text-yellow-300">
                             Skipped: {entry.error}
                           </span>
+                        )}
+                      </div>
+                      <span className="text-[#3f3f46] shrink-0 text-[10px]">
+                        {new Date(entry.timestamp).toLocaleTimeString()}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* ===== CHART MANAGER SECTION ===== */}
+          <div className={`bg-[#18181b] rounded-xl border ${cmEnabled ? 'border-cyan-500/50 shadow-lg shadow-cyan-500/10' : 'border-[#27272a]'} p-5 space-y-4 transition-all`}>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <Activity className={`w-5 h-5 ${cmEnabled ? 'text-cyan-400' : 'text-[#52525b]'}`} />
+                <div>
+                  <h3 className={`text-base font-semibold ${cmEnabled ? 'text-cyan-400' : 'text-white'}`}>
+                    Chart Manager
+                  </h3>
+                  <p className="text-xs text-[#52525b]">
+                    Auto counter-trade external buys/sells to stabilize price
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                {cmEnabled && (
+                  <button
+                    onClick={() => { setCmEnabled(false); addToast('Chart Manager stopped', 'info'); }}
+                    className="px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white text-xs font-bold rounded-lg transition-colors flex items-center gap-1.5 animate-pulse"
+                  >
+                    <Square className="w-3 h-3" />
+                    STOP
+                  </button>
+                )}
+                <button
+                  onClick={() => {
+                    const next = !cmEnabled;
+                    setCmEnabled(next);
+                    if (next) addToast('Chart Manager started', 'success');
+                  }}
+                  className={`relative w-12 h-6 rounded-full transition-colors ${
+                    cmEnabled ? 'bg-cyan-600' : 'bg-[#27272a]'
+                  }`}
+                >
+                  <span
+                    className={`absolute top-0.5 w-5 h-5 rounded-full bg-white transition-transform ${
+                      cmEnabled ? 'translate-x-6' : 'translate-x-0.5'
+                    }`}
+                  />
+                </button>
+              </div>
+            </div>
+
+            {/* Mode toggles */}
+            <div className="grid grid-cols-2 gap-3">
+              <button
+                onClick={() => setCmSellOnBuy(!cmSellOnBuy)}
+                className={`flex items-center gap-2 px-3 py-2.5 rounded-lg border text-sm font-medium transition-all ${
+                  cmSellOnBuy
+                    ? 'bg-red-500/15 border-red-500/40 text-red-400'
+                    : 'bg-[#09090b] border-[#27272a] text-[#52525b]'
+                }`}
+              >
+                <TrendingDown className="w-4 h-4" />
+                Sell on Buy
+              </button>
+              <button
+                onClick={() => setCmBuyOnSell(!cmBuyOnSell)}
+                className={`flex items-center gap-2 px-3 py-2.5 rounded-lg border text-sm font-medium transition-all ${
+                  cmBuyOnSell
+                    ? 'bg-green-500/15 border-green-500/40 text-green-400'
+                    : 'bg-[#09090b] border-[#27272a] text-[#52525b]'
+                }`}
+              >
+                <TrendingUp className="w-4 h-4" />
+                Buy on Sell
+              </button>
+            </div>
+
+            {/* Settings */}
+            <div className="grid grid-cols-3 gap-3">
+              <div>
+                <label className="block text-[10px] text-[#71717a] uppercase tracking-wider font-medium mb-1">
+                  Min $ Threshold
+                </label>
+                <div className="relative">
+                  <input
+                    type="number"
+                    value={cmMinDollar}
+                    onChange={(e) => setCmMinDollar(Math.max(0, parseFloat(e.target.value) || 0))}
+                    min={0}
+                    step={0.5}
+                    className="w-full bg-[#09090b] border border-[#27272a] rounded-lg px-3 py-2 text-white text-sm focus:ring-1 focus:ring-cyan-500/50 focus:border-cyan-500 outline-none pr-6"
+                  />
+                  <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[#52525b] text-xs">$</span>
+                </div>
+              </div>
+              <div>
+                <label className="block text-[10px] text-[#71717a] uppercase tracking-wider font-medium mb-1">
+                  Slippage
+                </label>
+                <div className="relative">
+                  <input
+                    type="number"
+                    value={cmSlippage / 100}
+                    onChange={(e) => setCmSlippage(Math.max(10, Math.min(5000, Math.round((parseFloat(e.target.value) || 1) * 100))))}
+                    min={0.1}
+                    max={50}
+                    step={0.5}
+                    className="w-full bg-[#09090b] border border-[#27272a] rounded-lg px-3 py-2 text-white text-sm focus:ring-1 focus:ring-cyan-500/50 focus:border-cyan-500 outline-none pr-6"
+                  />
+                  <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[#52525b] text-xs">%</span>
+                </div>
+              </div>
+              <div>
+                <label className="block text-[10px] text-[#71717a] uppercase tracking-wider font-medium mb-1">
+                  Poll Interval
+                </label>
+                <div className="relative">
+                  <input
+                    type="number"
+                    value={cmPollMs / 1000}
+                    onChange={(e) => {
+                      const val = parseFloat(e.target.value);
+                      if (!isNaN(val) && val > 0) setCmPollMs(Math.max(2000, Math.min(30000, val * 1000)));
+                    }}
+                    min={2}
+                    max={30}
+                    step={0.5}
+                    className="w-full bg-[#09090b] border border-[#27272a] rounded-lg px-3 py-2 text-white text-sm focus:ring-1 focus:ring-cyan-500/50 focus:border-cyan-500 outline-none pr-6"
+                  />
+                  <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[#52525b] text-xs">s</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Buy wallets info (auto-detected, sorted by USDC) */}
+            {cmBuyOnSell && (() => {
+              const buyWallets = wallets.filter(w => w.usdcBalance >= cmMinDollar).sort((a, b) => b.usdcBalance - a.usdcBalance);
+              const totalUsdc = buyWallets.reduce((s, w) => s + w.usdcBalance, 0);
+              return (
+                <div className="flex items-center gap-2 px-3 py-2 bg-[#09090b] border border-[#27272a] rounded-lg">
+                  <Wallet className="w-3.5 h-3.5 text-[#52525b]" />
+                  <span className="text-xs text-[#71717a]">Buy wallets:</span>
+                  {buyWallets.length > 0 ? (
+                    <span className="text-xs text-green-400">
+                      {buyWallets.length} wallets (${totalUsdc.toFixed(2)} USDC total)
+                    </span>
+                  ) : (
+                    <span className="text-xs text-red-400">No wallets with USDC found</span>
+                  )}
+                </div>
+              );
+            })()}
+
+            {/* Status indicator */}
+            {cmEnabled && (
+              <div className="flex items-center gap-2 px-3 py-2 bg-cyan-500/10 border border-cyan-500/20 rounded-lg">
+                <span className="relative flex h-2.5 w-2.5">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75" />
+                  <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-cyan-500" />
+                </span>
+                <span className="text-xs text-cyan-400 font-medium">
+                  Monitoring transactions... (
+                  {cmSellOnBuy && 'sell-on-buy'}
+                  {cmSellOnBuy && cmBuyOnSell && ' + '}
+                  {cmBuyOnSell && 'buy-on-sell'}
+                  {`, min $${cmMinDollar}, ${wallets.filter(w => w.tokenBalance > 0).length} sell wallets`}
+                  )
+                </span>
+              </div>
+            )}
+
+            {/* Activity log */}
+            {cmLog.length > 0 && (
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] text-[#71717a] uppercase tracking-wider font-medium">
+                    Activity Log ({cmLog.length})
+                  </span>
+                  <button
+                    onClick={() => setCmLog([])}
+                    className="text-[10px] text-[#52525b] hover:text-[#a1a1aa] transition-colors"
+                  >
+                    Clear
+                  </button>
+                </div>
+                <div className="max-h-64 overflow-y-auto space-y-1 scrollbar-thin">
+                  {cmLog.map((entry) => (
+                    <div
+                      key={entry.id}
+                      className={`flex items-start gap-2 px-3 py-2 rounded-lg text-xs ${
+                        entry.type === 'external-buy'
+                          ? 'bg-blue-500/10 border border-blue-500/20'
+                          : entry.type === 'external-sell'
+                          ? 'bg-orange-500/10 border border-orange-500/20'
+                          : entry.type === 'counter-sell'
+                          ? 'bg-green-500/10 border border-green-500/20'
+                          : entry.type === 'counter-buy'
+                          ? 'bg-emerald-500/10 border border-emerald-500/20'
+                          : entry.type === 'error'
+                          ? 'bg-red-500/10 border border-red-500/20'
+                          : 'bg-yellow-500/10 border border-yellow-500/20'
+                      }`}
+                    >
+                      <span className="mt-0.5 shrink-0">
+                        {entry.type === 'external-buy' && <TrendingUp className="w-3 h-3 text-blue-400" />}
+                        {entry.type === 'external-sell' && <TrendingDown className="w-3 h-3 text-orange-400" />}
+                        {entry.type === 'counter-sell' && <CheckCircle2 className="w-3 h-3 text-green-400" />}
+                        {entry.type === 'counter-buy' && <CheckCircle2 className="w-3 h-3 text-emerald-400" />}
+                        {entry.type === 'error' && <XCircle className="w-3 h-3 text-red-400" />}
+                        {entry.type === 'skip' && <AlertTriangle className="w-3 h-3 text-yellow-400" />}
+                      </span>
+                      <div className="flex-1 min-w-0">
+                        <span className={
+                          entry.type === 'external-buy' ? 'text-blue-300' :
+                          entry.type === 'external-sell' ? 'text-orange-300' :
+                          entry.type === 'counter-sell' ? 'text-green-300' :
+                          entry.type === 'counter-buy' ? 'text-emerald-300' :
+                          entry.type === 'error' ? 'text-red-300' :
+                          'text-yellow-300'
+                        }>
+                          {entry.message}
+                        </span>
+                        {entry.counterSignature && (
+                          <a
+                            href={`https://solscan.io/tx/${entry.counterSignature}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="ml-1.5 text-[#52525b] hover:text-purple-400 transition-colors inline-flex items-center gap-0.5"
+                          >
+                            <span className="font-mono">{entry.counterSignature.slice(0, 8)}...</span>
+                            <ExternalLink className="w-2.5 h-2.5" />
+                          </a>
                         )}
                       </div>
                       <span className="text-[#3f3f46] shrink-0 text-[10px]">

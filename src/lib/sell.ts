@@ -7,6 +7,7 @@ import {
   LAMPORTS_PER_SOL,
   sendAndConfirmTransaction,
   ComputeBudgetProgram,
+  VersionedTransaction,
 } from '@solana/web3.js';
 import { CpAmm } from '@meteora-ag/cp-amm-sdk';
 import BN from 'bn.js';
@@ -94,8 +95,11 @@ export async function sellTokensFromWallets(
   // Fetch pool state and time info once for all wallets
   const poolState = await cpAmm.fetchPoolState(pool);
   const currentSlot = await connection.getSlot();
-  const blockTime = await connection.getBlockTime(currentSlot);
-  const currentTime = blockTime || Math.floor(Date.now() / 1000);
+  let currentTime = Math.floor(Date.now() / 1000);
+  try {
+    const blockTime = await connection.getBlockTime(currentSlot - 2);
+    if (blockTime) currentTime = blockTime;
+  } catch {}
   const slippage = slippageBps / 10000;
 
   // Build all swap txs in parallel
@@ -137,7 +141,7 @@ export async function sellTokensFromWallets(
         let quote;
         try {
           quote = cpAmm.getQuote({
-            inAmount: swapAmount, inputTokenMint: mint, slippage,
+            inAmount: swapAmount, inputTokenMint: freshPoolState.tokenAMint, slippage,
             poolState: freshPoolState, currentTime, currentSlot,
             tokenADecimal: decimals, tokenBDecimal: quoteBDecimals,
           });
@@ -145,7 +149,7 @@ export async function sellTokensFromWallets(
           const errMsg = (quoteErr as Error).message;
           if (errMsg.includes('Price range is violated') || errMsg.includes('Amount out must be greater')) {
             const maxResult = findMaxSellable(
-              cpAmm, freshPoolState, mint, swapAmount,
+              cpAmm, freshPoolState, freshPoolState.tokenAMint, swapAmount,
               slippage, currentTime, currentSlot, decimals, quoteBDecimals
             );
             if (maxResult) {
@@ -230,8 +234,8 @@ function findMaxSellable(
   let high = requestedAmount;
   let bestAmount = new BN(0);
   let bestQuote: any = null;
+  let lastErr = '';
 
-  // Binary search with ~20 iterations (enough precision for u64)
   for (let i = 0; i < 30; i++) {
     const mid = low.add(high).div(new BN(2));
     if (mid.eq(low)) break;
@@ -247,7 +251,6 @@ function findMaxSellable(
         tokenADecimal,
         tokenBDecimal,
       });
-      // This amount works
       if (quote.swapOutAmount.gt(new BN(0))) {
         bestAmount = mid;
         bestQuote = quote;
@@ -255,10 +258,16 @@ function findMaxSellable(
       } else {
         high = mid;
       }
-    } catch {
-      // This amount is too large
+    } catch (e) {
+      lastErr = (e as Error).message;
       high = mid;
     }
+  }
+
+  if (bestAmount.eq(new BN(0))) {
+    console.error('[CM] findMaxSellable: no valid amount found. requested:', requestedAmount.toString(),
+      'lastErr:', lastErr, 'slot:', currentSlot, 'time:', currentTime,
+      'tokenADecimal:', tokenADecimal, 'tokenBDecimal:', tokenBDecimal);
   }
 
   if (bestAmount.gt(new BN(0)) && bestQuote) {
@@ -300,8 +309,11 @@ export async function getQuoteForWallets(
   }
 
   const currentSlot = await connection.getSlot();
-  const blockTime = await connection.getBlockTime(currentSlot);
-  const currentTime = blockTime || Math.floor(Date.now() / 1000);
+  let currentTime = Math.floor(Date.now() / 1000);
+  try {
+    const blockTime = await connection.getBlockTime(currentSlot - 2);
+    if (blockTime) currentTime = blockTime;
+  } catch {}
   const slippage = slippageBps / 10000;
 
   for (const wallet of wallets) {
@@ -350,7 +362,7 @@ export async function getQuoteForWallets(
       try {
         const quote = cpAmm.getQuote({
           inAmount: swapAmount,
-          inputTokenMint: mint,
+          inputTokenMint: poolState.tokenAMint,
           slippage,
           poolState,
           currentTime,
@@ -373,7 +385,7 @@ export async function getQuoteForWallets(
         if (errMsg.includes('Price range is violated') || errMsg.includes('Amount out must be greater')) {
           // Find max sellable amount
           const maxResult = findMaxSellable(
-            cpAmm, poolState, mint, swapAmount,
+            cpAmm, poolState, poolState.tokenAMint, swapAmount,
             slippage, currentTime, currentSlot, decimals, quoteBDecimals
           );
 
@@ -565,38 +577,58 @@ export async function buyTokensForWallet(
       Math.floor(quoteAmount * 10 ** quoteBDecimals).toString()
     );
 
-    const currentSlot = await connection.getSlot();
-    const blockTime = await connection.getBlockTime(currentSlot);
-    const currentTime = blockTime || Math.floor(Date.now() / 1000);
     const slippage = slippageBps / 10000;
 
     // Reverse direction: input = tokenB (SOL/USDC), output = tokenA (token)
-    const quote = cpAmm.getQuote({
-      inAmount: rawQuoteAmount,
-      inputTokenMint: poolState.tokenBMint,
-      slippage,
-      poolState,
-      currentTime,
-      currentSlot,
-      tokenADecimal: decimals,
-      tokenBDecimal: quoteBDecimals,
-    });
+    let quote;
+    let activePoolState = poolState;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const currentSlot = await connection.getSlot();
+      let currentTime = Math.floor(Date.now() / 1000);
+      try {
+        const bt = await connection.getBlockTime(currentSlot - 2);
+        if (bt) currentTime = bt;
+      } catch {}
+
+      if (attempt > 0) {
+        await new Promise(r => setTimeout(r, 500));
+        activePoolState = await cpAmm.fetchPoolState(pool);
+      }
+
+      try {
+        quote = cpAmm.getQuote({
+          inAmount: rawQuoteAmount,
+          inputTokenMint: activePoolState.tokenBMint,
+          slippage,
+          poolState: activePoolState,
+          currentTime,
+          currentSlot,
+          tokenADecimal: decimals,
+          tokenBDecimal: quoteBDecimals,
+        });
+        break;
+      } catch (quoteErr) {
+        if (attempt === 2) throw quoteErr;
+      }
+    }
+    if (!quote) throw new Error('Failed to get buy quote after retries');
 
     const swapTx = await cpAmm.swap({
       payer: keypair.publicKey,
       pool,
-      inputTokenMint: poolState.tokenBMint,
-      outputTokenMint: poolState.tokenAMint,
+      inputTokenMint: activePoolState.tokenBMint,
+      outputTokenMint: activePoolState.tokenAMint,
       amountIn: rawQuoteAmount,
       minimumAmountOut: quote.minSwapOutAmount,
-      tokenAMint: poolState.tokenAMint,
-      tokenBMint: poolState.tokenBMint,
-      tokenAVault: poolState.tokenAVault,
-      tokenBVault: poolState.tokenBVault,
-      tokenAProgram: poolState.tokenAFlag
+      tokenAMint: activePoolState.tokenAMint,
+      tokenBMint: activePoolState.tokenBMint,
+      tokenAVault: activePoolState.tokenAVault,
+      tokenBVault: activePoolState.tokenBVault,
+      tokenAProgram: activePoolState.tokenAFlag
         ? TOKEN_2022_PROGRAM_ID
         : new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
-      tokenBProgram: (poolState as any).tokenBFlag
+      tokenBProgram: (activePoolState as any).tokenBFlag
         ? TOKEN_2022_PROGRAM_ID
         : new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
       referralTokenAccount: null,
@@ -606,11 +638,16 @@ export async function buyTokensForWallet(
       ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 })
     );
 
-    const { blockhash } = await connection.getLatestBlockhash();
+    const { blockhash } = await connection.getLatestBlockhash('confirmed');
     (swapTx as any).recentBlockhash = blockhash;
     (swapTx as any).feePayer = keypair.publicKey;
+    (swapTx as any).sign(keypair);
 
-    const sig = await sendAndConfirmTransaction(connection, swapTx as any, [keypair]);
+    const rawTx = (swapTx as any).serialize();
+    const sig = await connection.sendRawTransaction(rawTx, {
+      skipPreflight: true,
+      maxRetries: 5,
+    });
 
     // Parse confirmed transaction to get real token delta from preTokenBalances/postTokenBalances
     let tokensReceived: number = 0;
@@ -618,7 +655,7 @@ export async function buyTokensForWallet(
     const tokenMintStr = mint.toBase58();
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        if (attempt > 0) await new Promise(r => setTimeout(r, 1500));
+        if (attempt > 0) await new Promise(r => setTimeout(r, 500));
         const parsedTx = await connection.getParsedTransaction(sig, {
           commitment: 'confirmed',
           maxSupportedTransactionVersion: 0,
@@ -742,8 +779,8 @@ export async function sellExactTokenAmount(
     let swapAmount = new BN(rawSellAmount.toString());
     const slippage = slippageBps / 10000;
 
-    const poolState = await cpAmm.fetchPoolState(pool);
-    const tokenBMintStr = poolState.tokenBMint.toBase58();
+    let activePoolState = await cpAmm.fetchPoolState(pool);
+    const tokenBMintStr = activePoolState.tokenBMint.toBase58();
     if (USDC_MINTS.includes(tokenBMintStr)) {
       quoteBDecimals = 6;
       quoteSymbol = 'USDC';
@@ -752,54 +789,78 @@ export async function sellExactTokenAmount(
       quoteSymbol = 'SOL';
     }
 
-    const currentSlot = await connection.getSlot();
-    const blockTime = await connection.getBlockTime(currentSlot);
-    const currentTime = blockTime || Math.floor(Date.now() / 1000);
-
     let quote;
-    try {
-      quote = cpAmm.getQuote({
-        inAmount: swapAmount,
-        inputTokenMint: mint,
-        slippage,
-        poolState,
-        currentTime,
-        currentSlot,
-        tokenADecimal: decimals,
-        tokenBDecimal: quoteBDecimals,
-      });
-    } catch (quoteErr) {
-      const errMsg = (quoteErr as Error).message;
-      if (errMsg.includes('Price range is violated') || errMsg.includes('Amount out must be greater')) {
-        const maxResult = findMaxSellable(
-          cpAmm, poolState, mint, swapAmount,
-          slippage, currentTime, currentSlot, decimals, quoteBDecimals
-        );
-        if (maxResult) {
-          swapAmount = maxResult.maxAmount;
-          quote = maxResult.quote;
-          rawSellAmount = BigInt(swapAmount.toString());
+
+    console.log('[CM-sell] Starting quote. tokenAmount:', tokenAmount,
+      'rawSellAmount:', rawSellAmount.toString(), 'decimals:', decimals,
+      'quoteBDecimals:', quoteBDecimals, 'slippage:', slippage);
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const currentSlot = await connection.getSlot();
+      let currentTime = Math.floor(Date.now() / 1000);
+      try {
+        const bt = await connection.getBlockTime(currentSlot - 2);
+        if (bt) currentTime = bt;
+      } catch {}
+
+      if (attempt > 0) {
+        await new Promise(r => setTimeout(r, 500));
+        activePoolState = await cpAmm.fetchPoolState(pool);
+      }
+
+      console.log('[CM-sell] attempt', attempt, 'slot:', currentSlot, 'time:', currentTime,
+        'swapAmount:', swapAmount.toString(),
+        'poolTokenA:', activePoolState.tokenAMint.toBase58().slice(0, 8),
+        'poolTokenB:', activePoolState.tokenBMint.toBase58().slice(0, 8));
+
+      try {
+        quote = cpAmm.getQuote({
+          inAmount: swapAmount,
+          inputTokenMint: activePoolState.tokenAMint,
+          slippage,
+          poolState: activePoolState,
+          currentTime,
+          currentSlot,
+          tokenADecimal: decimals,
+          tokenBDecimal: quoteBDecimals,
+        });
+        break;
+      } catch (quoteErr) {
+        const errMsg = (quoteErr as Error).message;
+        if (errMsg.includes('Price range is violated') || errMsg.includes('Amount out must be greater')) {
+          const maxResult = findMaxSellable(
+            cpAmm, activePoolState, activePoolState.tokenAMint, swapAmount,
+            slippage, currentTime, currentSlot, decimals, quoteBDecimals
+          );
+          if (maxResult) {
+            swapAmount = maxResult.maxAmount;
+            quote = maxResult.quote;
+            rawSellAmount = BigInt(swapAmount.toString());
+            break;
+          }
+          if (attempt === 2) {
+            throw new Error(`Quote failed (slot:${currentSlot} amount:${swapAmount.toString()} dec:${decimals}/${quoteBDecimals} slip:${slippage}): ${errMsg}`);
+          }
         } else {
-          throw new Error('Pool has no liquidity for this swap');
+          throw quoteErr;
         }
-      } else {
-        throw quoteErr;
       }
     }
+    if (!quote) throw new Error('Failed to get swap quote after retries');
 
     const swapTx = await cpAmm.swap({
       payer: keypair.publicKey,
       pool,
-      inputTokenMint: poolState.tokenAMint,
-      outputTokenMint: poolState.tokenBMint,
+      inputTokenMint: activePoolState.tokenAMint,
+      outputTokenMint: activePoolState.tokenBMint,
       amountIn: swapAmount,
       minimumAmountOut: quote.minSwapOutAmount,
-      tokenAMint: poolState.tokenAMint,
-      tokenBMint: poolState.tokenBMint,
-      tokenAVault: poolState.tokenAVault,
-      tokenBVault: poolState.tokenBVault,
-      tokenAProgram: poolState.tokenAFlag ? TOKEN_2022_PROGRAM_ID : new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
-      tokenBProgram: (poolState as any).tokenBFlag ? TOKEN_2022_PROGRAM_ID : new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
+      tokenAMint: activePoolState.tokenAMint,
+      tokenBMint: activePoolState.tokenBMint,
+      tokenAVault: activePoolState.tokenAVault,
+      tokenBVault: activePoolState.tokenBVault,
+      tokenAProgram: activePoolState.tokenAFlag ? TOKEN_2022_PROGRAM_ID : new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
+      tokenBProgram: (activePoolState as any).tokenBFlag ? TOKEN_2022_PROGRAM_ID : new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
       referralTokenAccount: null,
     });
 
@@ -807,11 +868,16 @@ export async function sellExactTokenAmount(
       ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 })
     );
 
-    const { blockhash } = await connection.getLatestBlockhash();
+    const { blockhash } = await connection.getLatestBlockhash('confirmed');
     (swapTx as any).recentBlockhash = blockhash;
     (swapTx as any).feePayer = keypair.publicKey;
+    (swapTx as any).sign(keypair);
 
-    const sig = await sendAndConfirmTransaction(connection, swapTx as any, [keypair]);
+    const rawTx = (swapTx as any).serialize();
+    const sig = await connection.sendRawTransaction(rawTx, {
+      skipPreflight: true,
+      maxRetries: 5,
+    });
 
     return {
       walletId: wallet.id,
@@ -1258,4 +1324,249 @@ export async function batchSendFromWallets(
     }
     return { walletId: item.walletId, signature: sig, status: 'timeout' as const, error: 'Confirmation timeout' };
   });
+}
+
+// ============================================================
+// Raydium SDK: sell/buy directly on a specific Raydium pool
+// ============================================================
+
+import { Raydium, TxVersion } from '@raydium-io/raydium-sdk-v2';
+import type { PoolType } from '@/lib/pool-utils';
+
+const USDC_MINT_ADDR = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+
+function getQuoteDecimals(mint: string): number {
+  return mint === USDC_MINT_ADDR ? 6 : 9;
+}
+function getQuoteSymbol(mint: string): string {
+  return mint === USDC_MINT_ADDR ? 'USDC' : 'SOL';
+}
+
+async function confirmTx(connection: Connection, signature: string, timeoutMs = 12000): Promise<{ confirmed: boolean; error?: string }> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const resp = await connection.getSignatureStatuses([signature]);
+      const status = resp.value[0];
+      if (status) {
+        if (status.err) {
+          return { confirmed: false, error: `Transaction failed on-chain: ${JSON.stringify(status.err)}` };
+        }
+        if (status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized') {
+          return { confirmed: true };
+        }
+      }
+    } catch {}
+    await new Promise(r => setTimeout(r, 1500));
+  }
+  return { confirmed: false, error: 'Transaction confirmation timeout' };
+}
+
+async function initRaydium(connection: Connection, keypair: Keypair) {
+  return Raydium.load({
+    owner: keypair,
+    connection,
+    cluster: 'mainnet',
+    disableFeatureCheck: true,
+    disableLoadToken: true,
+    blockhashCommitment: 'finalized',
+  });
+}
+
+export async function sellViaRaydium(
+  connection: Connection,
+  poolAddress: string,
+  poolType: PoolType,
+  tokenMint: string,
+  quoteMint: string,
+  wallet: WalletEntry,
+  tokenAmount: number,
+  slippageBps: number,
+  decimals: number,
+): Promise<SellResult> {
+  const qDec = getQuoteDecimals(quoteMint);
+  const qSym = getQuoteSymbol(quoteMint);
+  try {
+    const keypair = Keypair.fromSecretKey(bs58.decode(wallet.privateKey));
+    const mint = new PublicKey(tokenMint);
+    const tokenProgram = await detectTokenProgram(connection, mint);
+    const ata = getAssociatedTokenAddressSync(mint, keypair.publicKey, false, tokenProgram);
+
+    let balance: bigint;
+    try {
+      const account = await getAccount(connection, ata, 'confirmed', tokenProgram);
+      balance = account.amount;
+    } catch {
+      return { walletId: wallet.id, walletPublicKey: wallet.publicKey, error: 'No token account found', amountSold: 0 };
+    }
+
+    let rawAmount = BigInt(Math.floor(tokenAmount * 10 ** decimals));
+    if (rawAmount > balance) rawAmount = balance;
+    if (rawAmount === BigInt(0)) {
+      return { walletId: wallet.id, walletPublicKey: wallet.publicKey, error: 'Zero balance', amountSold: 0 };
+    }
+
+    const raydium = await initRaydium(connection, keypair);
+    const slippage = slippageBps / 10000;
+    const amountIn = new BN(rawAmount.toString());
+    let sig: string;
+    let quoteReceived = 0;
+
+    if (poolType === 'raydium-amm-v4') {
+      const { poolInfo, poolKeys } = await raydium.liquidity.getPoolInfoFromRpc({ poolId: poolAddress });
+      const out = raydium.liquidity.computeAmountOut({
+        poolInfo, amountIn, mintIn: tokenMint, mintOut: quoteMint, slippage,
+      });
+      quoteReceived = Number(out.amountOut.toString()) / 10 ** qDec;
+      const { execute } = await raydium.liquidity.swap({
+        poolInfo, poolKeys, amountIn, amountOut: out.minAmountOut,
+        inputMint: tokenMint, fixedSide: 'in',
+        txVersion: TxVersion.LEGACY,
+        computeBudgetConfig: { units: 400_000, microLamports: 100_000 },
+      });
+      const res = await execute({ sendAndConfirm: false });
+      sig = res.txId;
+    } else if (poolType === 'raydium-cpmm') {
+      const data = await raydium.cpmm.getPoolInfoFromRpc(poolAddress);
+      const baseIn = tokenMint === data.poolInfo.mintA.address;
+      const { getPoolInfo: getPI } = await import('@/lib/pool-utils');
+      const pi = await getPI(connection, poolAddress);
+      const inputVault = baseIn ? pi.tokenAVault : pi.tokenBVault;
+      const outputVault = baseIn ? pi.tokenBVault : pi.tokenAVault;
+      const [inputAccount, outputAccount] = await Promise.all([
+        getAccount(connection, new PublicKey(inputVault), 'confirmed'),
+        getAccount(connection, new PublicKey(outputVault), 'confirmed'),
+      ]);
+      const inputReserve = BigInt(inputAccount.amount.toString());
+      const outputReserve = BigInt(outputAccount.amount.toString());
+      const amountOutRaw = (rawAmount * outputReserve) / (inputReserve + rawAmount);
+      const minAmountOut = amountOutRaw * BigInt(Math.floor((1 - slippage) * 10000)) / BigInt(10000);
+      quoteReceived = Number(amountOutRaw) / 10 ** qDec;
+      const { execute } = await raydium.cpmm.swap({
+        poolInfo: data.poolInfo as any, poolKeys: data.poolKeys as any,
+        baseIn, swapResult: { inputAmount: new BN(rawAmount.toString()), outputAmount: new BN(minAmountOut.toString()) }, inputAmount: amountIn,
+        txVersion: TxVersion.LEGACY,
+        computeBudgetConfig: { units: 400_000, microLamports: 100_000 },
+      });
+      const res = await execute({ sendAndConfirm: false });
+      sig = res.txId;
+    } else {
+      return { walletId: wallet.id, walletPublicKey: wallet.publicKey, error: `Pool type ${poolType} not supported for sell`, amountSold: 0 };
+    }
+
+    const conf = await confirmTx(connection, sig);
+    if (!conf.confirmed) {
+      return { walletId: wallet.id, walletPublicKey: wallet.publicKey, error: conf.error || 'Sell tx not confirmed', amountSold: 0 };
+    }
+
+    return {
+      walletId: wallet.id, walletPublicKey: wallet.publicKey,
+      signature: sig, amountSold: Number(rawAmount) / 10 ** decimals,
+      quoteReceived, quoteSymbol: qSym,
+    };
+  } catch (err) {
+    return { walletId: wallet.id, walletPublicKey: wallet.publicKey, error: (err as Error).message, amountSold: 0 };
+  }
+}
+
+export async function buyViaRaydium(
+  connection: Connection,
+  poolAddress: string,
+  poolType: PoolType,
+  tokenMint: string,
+  quoteMint: string,
+  wallet: WalletEntry,
+  quoteAmount: number,
+  slippageBps: number,
+  tokenDecimals: number,
+): Promise<BuyResult> {
+  const qDec = getQuoteDecimals(quoteMint);
+  const qSym = getQuoteSymbol(quoteMint);
+  const WSOL = 'So11111111111111111111111111111111111111112';
+  try {
+    const keypair = Keypair.fromSecretKey(bs58.decode(wallet.privateKey));
+
+    // Verify actual on-chain quote balance before buying
+    let actualQuoteBalance: number;
+    if (quoteMint === WSOL) {
+      const lamports = await connection.getBalance(keypair.publicKey, 'confirmed');
+      actualQuoteBalance = Math.max(0, lamports - 50_000) / LAMPORTS_PER_SOL;
+    } else {
+      const quoteMintPk = new PublicKey(quoteMint);
+      const qProg = await detectTokenProgram(connection, quoteMintPk);
+      const quoteAta = getAssociatedTokenAddressSync(quoteMintPk, keypair.publicKey, false, qProg);
+      try {
+        const acc = await getAccount(connection, quoteAta, 'confirmed', qProg);
+        actualQuoteBalance = Number(acc.amount) / 10 ** qDec;
+      } catch {
+        return { walletId: wallet.id, walletPublicKey: wallet.publicKey, error: `No ${qSym} token account`, quoteSpent: 0, tokensReceived: 0, quoteSymbol: qSym };
+      }
+    }
+
+    if (actualQuoteBalance < 0.001) {
+      return { walletId: wallet.id, walletPublicKey: wallet.publicKey, error: `Insufficient ${qSym}: ${actualQuoteBalance.toFixed(4)}`, quoteSpent: 0, tokensReceived: 0, quoteSymbol: qSym };
+    }
+
+    const effectiveAmount = Math.min(quoteAmount, actualQuoteBalance);
+    const rawQuoteAmount = new BN(Math.floor(effectiveAmount * 10 ** qDec).toString());
+    const raydium = await initRaydium(connection, keypair);
+    const slippage = slippageBps / 10000;
+    let sig: string;
+    let tokensReceived = 0;
+
+    if (poolType === 'raydium-amm-v4') {
+      const { poolInfo, poolKeys } = await raydium.liquidity.getPoolInfoFromRpc({ poolId: poolAddress });
+      const out = raydium.liquidity.computeAmountOut({
+        poolInfo, amountIn: rawQuoteAmount, mintIn: quoteMint, mintOut: tokenMint, slippage,
+      });
+      tokensReceived = Number(out.amountOut.toString()) / 10 ** tokenDecimals;
+      const { execute } = await raydium.liquidity.swap({
+        poolInfo, poolKeys, amountIn: rawQuoteAmount, amountOut: out.minAmountOut,
+        inputMint: quoteMint, fixedSide: 'in',
+        txVersion: TxVersion.LEGACY,
+        computeBudgetConfig: { units: 400_000, microLamports: 100_000 },
+      });
+      const res = await execute({ sendAndConfirm: false });
+      sig = res.txId;
+    } else if (poolType === 'raydium-cpmm') {
+      const data = await raydium.cpmm.getPoolInfoFromRpc(poolAddress);
+      const baseIn = quoteMint === data.poolInfo.mintA.address;
+      const { getPoolInfo: getPI } = await import('@/lib/pool-utils');
+      const pi = await getPI(connection, poolAddress);
+      const inputVault = baseIn ? pi.tokenAVault : pi.tokenBVault;
+      const outputVault = baseIn ? pi.tokenBVault : pi.tokenAVault;
+      const [inputAccount, outputAccount] = await Promise.all([
+        getAccount(connection, new PublicKey(inputVault), 'confirmed'),
+        getAccount(connection, new PublicKey(outputVault), 'confirmed'),
+      ]);
+      const inputReserve = BigInt(inputAccount.amount.toString());
+      const outputReserve = BigInt(outputAccount.amount.toString());
+      const rawQuoteBI = BigInt(rawQuoteAmount.toString());
+      const amountOutRaw = (rawQuoteBI * outputReserve) / (inputReserve + rawQuoteBI);
+      const minAmountOut = amountOutRaw * BigInt(Math.floor((1 - slippage) * 10000)) / BigInt(10000);
+      tokensReceived = Number(amountOutRaw) / 10 ** tokenDecimals;
+      const { execute } = await raydium.cpmm.swap({
+        poolInfo: data.poolInfo as any, poolKeys: data.poolKeys as any,
+        baseIn, swapResult: { inputAmount: rawQuoteAmount, outputAmount: new BN(minAmountOut.toString()) }, inputAmount: rawQuoteAmount,
+        txVersion: TxVersion.LEGACY,
+        computeBudgetConfig: { units: 400_000, microLamports: 100_000 },
+      });
+      const res = await execute({ sendAndConfirm: false });
+      sig = res.txId;
+    } else {
+      return { walletId: wallet.id, walletPublicKey: wallet.publicKey, error: `Pool type ${poolType} not supported for buy`, quoteSpent: quoteAmount, tokensReceived: 0, quoteSymbol: qSym };
+    }
+
+    const conf = await confirmTx(connection, sig);
+    if (!conf.confirmed) {
+      return { walletId: wallet.id, walletPublicKey: wallet.publicKey, error: conf.error || 'Buy tx not confirmed', quoteSpent: quoteAmount, tokensReceived: 0, quoteSymbol: qSym };
+    }
+
+    return {
+      walletId: wallet.id, walletPublicKey: wallet.publicKey,
+      signature: sig, quoteSpent: effectiveAmount, tokensReceived, quoteSymbol: qSym,
+    };
+  } catch (err) {
+    return { walletId: wallet.id, walletPublicKey: wallet.publicKey, error: (err as Error).message, quoteSpent: 0, tokensReceived: 0, quoteSymbol: qSym };
+  }
 }
