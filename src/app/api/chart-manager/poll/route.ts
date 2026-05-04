@@ -1,12 +1,13 @@
 import { NextResponse } from 'next/server';
 import { getConnection } from '@/lib/solana';
-import { sellExactTokenAmount, buyTokensForWallet, sellViaRaydium, buyViaRaydium } from '@/lib/sell';
-import { getPoolInfo, isRaydiumPool, getQuoteMint } from '@/lib/pool-utils';
+import { sellExactTokenAmount, buyTokensForWallet, sellViaRaydium, buyViaRaydium, sellViaDlmm, buyViaDlmm } from '@/lib/sell';
+import { getPoolInfo, isRaydiumPool, isDlmmPool, getQuoteMint } from '@/lib/pool-utils';
+import type { PoolInfo } from '@/lib/pool-utils';
 import type { WalletEntry } from '@/types';
 import { PublicKey } from '@solana/web3.js';
 
 export const dynamic = 'force-dynamic';
-export const maxDuration = 30;
+export const maxDuration = 60;
 
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY || '';
 
@@ -15,13 +16,26 @@ const QUOTE_MINTS = new Set([
   'So11111111111111111111111111111111111111112',      // Wrapped SOL
 ]);
 
+const WSOL_MINT = 'So11111111111111111111111111111111111111112';
+
+interface PoolContext {
+  poolAddress: string;
+  poolInfo: PoolInfo;
+  quoteMint: string;
+  tokenVault: string;
+  quoteVault: string;
+  quoteIsSOL: boolean;
+}
+
 interface DetectedTrade {
   signature: string;
   type: 'external-buy' | 'external-sell';
   tokenAmount: number;
+  quoteAmount: number;
   dollarAmount: number;
   trader: string;
   timestamp: number;
+  pool: PoolContext;
 }
 
 interface ChartManagerEvent {
@@ -36,14 +50,58 @@ interface ChartManagerEvent {
   message: string;
 }
 
+async function fetchSolPrice(): Promise<number> {
+  try {
+    const res = await fetch('https://api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112');
+    if (res.ok) {
+      const data = await res.json();
+      return parseFloat(data.data?.[WSOL_MINT]?.price || '0');
+    }
+  } catch {}
+  return 150;
+}
+
+function buildPoolContext(poolAddress: string, poolInfo: PoolInfo, tokenMint: string): PoolContext {
+  const quoteMint = getQuoteMint(poolInfo, tokenMint);
+  const tokenVault = poolInfo.tokenAMint === tokenMint ? poolInfo.tokenAVault : poolInfo.tokenBVault;
+  const quoteVault = poolInfo.tokenAMint === tokenMint ? poolInfo.tokenBVault : poolInfo.tokenAVault;
+  return { poolAddress, poolInfo, quoteMint, tokenVault, quoteVault, quoteIsSOL: quoteMint === WSOL_MINT };
+}
+
+async function executeSell(
+  connection: any, pool: PoolContext, tokenMint: string,
+  wallet: WalletEntry, amount: number, slippageBps: number, tokenDecimals: number,
+) {
+  if (isRaydiumPool(pool.poolInfo.type)) {
+    return sellViaRaydium(connection, pool.poolAddress, pool.poolInfo.type, tokenMint, pool.quoteMint, wallet, amount, slippageBps, tokenDecimals);
+  } else if (isDlmmPool(pool.poolInfo.type)) {
+    return sellViaDlmm(connection, pool.poolAddress, tokenMint, pool.quoteMint, wallet, amount, slippageBps, tokenDecimals);
+  }
+  return sellExactTokenAmount(connection, pool.poolAddress, tokenMint, wallet, amount, slippageBps, tokenDecimals);
+}
+
+async function executeBuy(
+  connection: any, pool: PoolContext, tokenMint: string,
+  wallet: WalletEntry, quoteAmount: number, slippageBps: number, tokenDecimals: number,
+) {
+  if (isRaydiumPool(pool.poolInfo.type)) {
+    return buyViaRaydium(connection, pool.poolAddress, pool.poolInfo.type, tokenMint, pool.quoteMint, wallet, quoteAmount, slippageBps, tokenDecimals);
+  } else if (isDlmmPool(pool.poolInfo.type)) {
+    return buyViaDlmm(connection, pool.poolAddress, tokenMint, pool.quoteMint, wallet, quoteAmount, slippageBps, tokenDecimals);
+  }
+  return buyTokensForWallet(connection, pool.poolAddress, tokenMint, wallet, quoteAmount, slippageBps, tokenDecimals);
+}
+
 export async function POST(request: Request) {
   try {
     const body = await request.json();
     const {
       poolAddress,
+      poolAddress2,
       tokenMint,
       ownWallets,
       lastSignature,
+      lastSignature2,
       minDollar,
       mode,
       sellWallets,
@@ -61,63 +119,93 @@ export async function POST(request: Request) {
     const ownSigSet = new Set<string>(body.ownSignatures || []);
     const events: ChartManagerEvent[] = [];
 
-    const poolInfo = await getPoolInfo(connection, poolAddress);
-    const tokenAVault = poolInfo.tokenAVault;
-    const tokenBVault = poolInfo.tokenBVault;
-    const useJupiter = isRaydiumPool(poolInfo.type);
-    const quoteMint = getQuoteMint(poolInfo, tokenMint);
+    // Build pool contexts
+    const pool1Info = await getPoolInfo(connection, poolAddress);
+    const pool1 = buildPoolContext(poolAddress, pool1Info, tokenMint);
 
-    // Step 1: Get new signatures since lastSignature
-    const sigParams: any = { limit: 50 };
-    if (lastSignature) {
-      sigParams.until = lastSignature;
+    let pool2: PoolContext | null = null;
+    if (poolAddress2?.trim()) {
+      const pool2Info = await getPoolInfo(connection, poolAddress2.trim());
+      pool2 = buildPoolContext(poolAddress2.trim(), pool2Info, tokenMint);
     }
 
-    const signatures = await connection.getSignaturesForAddress(
-      new PublicKey(poolAddress),
-      sigParams,
-    );
+    // Fetch SOL price if any pool uses SOL as quote
+    let solPrice = 0;
+    if (pool1.quoteIsSOL || pool2?.quoteIsSOL) {
+      solPrice = await fetchSolPrice();
+      console.log('[CM] SOL price:', solPrice);
+    }
 
-    if (signatures.length === 0) {
+    // Step 1: Get new signatures from pool 1
+    const sigParams1: any = { limit: 50 };
+    if (lastSignature) sigParams1.until = lastSignature;
+
+    const signatures1 = await connection.getSignaturesForAddress(new PublicKey(poolAddress), sigParams1);
+    let newLastSig = signatures1.length > 0 ? signatures1[0].signature : (lastSignature || null);
+
+    // Get new signatures from pool 2
+    let newLastSig2 = lastSignature2 || null;
+    let signatures2: any[] = [];
+    if (pool2) {
+      const sigParams2: any = { limit: 50 };
+      if (lastSignature2) sigParams2.until = lastSignature2;
+      signatures2 = await connection.getSignaturesForAddress(new PublicKey(poolAddress2.trim()), sigParams2);
+      if (signatures2.length > 0) newLastSig2 = signatures2[0].signature;
+    }
+
+    const totalSigs = signatures1.length + signatures2.length;
+
+    if (totalSigs === 0) {
       return NextResponse.json({
         success: true,
-        data: { events: [], lastSignature: lastSignature || null },
+        data: { events: [], lastSignature: lastSignature || null, lastSignature2: newLastSig2 },
       });
     }
 
-    const newLastSig = signatures[0].signature;
-
-    if (!lastSignature) {
-      console.log('[CM] First poll — baseline set:', newLastSig.slice(0, 12));
+    // First poll baseline
+    if (!lastSignature && signatures1.length > 0) {
+      console.log('[CM] First poll — baseline pool1:', newLastSig?.slice(0, 12));
+      if (!lastSignature2 && signatures2.length > 0) {
+        console.log('[CM] First poll — baseline pool2:', newLastSig2?.slice(0, 12));
+      }
       return NextResponse.json({
         success: true,
-        data: { events: [], lastSignature: newLastSig },
+        data: { events: [], lastSignature: newLastSig, lastSignature2: newLastSig2 },
       });
     }
 
-    console.log('[CM] Processing', signatures.length, 'new signatures');
+    // Step 2: Merge and deduplicate signatures, tag with pool
+    const sigPoolMap = new Map<string, PoolContext>();
+    for (const s of signatures1) {
+      if (lastSignature) sigPoolMap.set(s.signature, pool1);
+    }
+    if (pool2 && lastSignature2) {
+      for (const s of signatures2) {
+        if (!sigPoolMap.has(s.signature)) sigPoolMap.set(s.signature, pool2);
+      }
+    }
 
-    // Step 2: Fetch parsed transactions from Helius
-    const sigList = signatures.map(s => s.signature);
-    const parsedTxs = await fetchParsedTransactions(sigList);
+    const allSigList = [...sigPoolMap.keys()];
+    console.log('[CM] Processing', allSigList.length, 'signatures (pool1:', signatures1.length, 'pool2:', signatures2.length, ')');
 
+    // Step 3: Fetch parsed transactions from Helius
+    const parsedTxs = await fetchParsedTransactions(allSigList);
     console.log('[CM] Helius returned', parsedTxs.length, 'parsed txs');
 
-    // Step 3: Detect external trades via vault flow cross-validation
+    // Step 4: Detect external trades via vault flow cross-validation
     const trades: DetectedTrade[] = [];
 
     for (const tx of parsedTxs) {
       if (!tx) continue;
-
       if (tx.transactionError) continue;
-
       if (ownSigSet.has(tx.signature)) continue;
 
       const feePayer = tx.feePayer || '';
-
       if (ownWalletSet.has(feePayer)) continue;
 
       const transfers = tx.tokenTransfers || [];
+      const pool = sigPoolMap.get(tx.signature) || pool1;
+
       let tokenFromVault = 0;
       let tokenToVault = 0;
       let quoteFromVault = 0;
@@ -132,47 +220,37 @@ export async function POST(request: Request) {
         const toAcct = t.toTokenAccount || t.toUserAccount || '';
 
         if (mint === tokenMint) {
-          if (fromAcct === tokenAVault) tokenFromVault += amount;
-          if (toAcct === tokenAVault) tokenToVault += amount;
+          if (fromAcct === pool.tokenVault) tokenFromVault += amount;
+          if (toAcct === pool.tokenVault) tokenToVault += amount;
         }
 
         if (QUOTE_MINTS.has(mint)) {
-          if (fromAcct === tokenBVault) quoteFromVault += amount;
-          if (toAcct === tokenBVault) quoteToVault += amount;
+          if (fromAcct === pool.quoteVault) quoteFromVault += amount;
+          if (toAcct === pool.quoteVault) quoteToVault += amount;
         }
       }
 
-      // Net flows: positive = outflow from vault, negative = inflow to vault
       const netTokenOut = tokenFromVault - tokenToVault;
       const netQuoteOut = quoteFromVault - quoteToVault;
 
-      // Cross-flow validation: swap = token and quote flow opposite directions
-      // BUY  → tokens leave vault (netTokenOut > 0), quote enters vault (netQuoteOut < 0)
-      // SELL → tokens enter vault (netTokenOut < 0), quote leaves vault (netQuoteOut > 0)
-      // LP add/remove → both flow same direction → excluded
-
       if (netTokenOut > 0 && netQuoteOut < 0) {
-        const dollarAmount = Math.abs(netQuoteOut);
+        const quoteAmount = Math.abs(netQuoteOut);
+        const dollarAmount = pool.quoteIsSOL ? quoteAmount * solPrice : quoteAmount;
         if (dollarAmount >= (minDollar || 0)) {
           trades.push({
-            signature: tx.signature,
-            type: 'external-buy',
-            tokenAmount: netTokenOut,
-            dollarAmount,
-            trader: feePayer,
-            timestamp: tx.timestamp || 0,
+            signature: tx.signature, type: 'external-buy',
+            tokenAmount: netTokenOut, quoteAmount, dollarAmount,
+            trader: feePayer, timestamp: tx.timestamp || 0, pool,
           });
         }
       } else if (netTokenOut < 0 && netQuoteOut > 0) {
         const tokenAmount = Math.abs(netTokenOut);
-        if (netQuoteOut >= (minDollar || 0)) {
+        const dollarAmount = pool.quoteIsSOL ? netQuoteOut * solPrice : netQuoteOut;
+        if (dollarAmount >= (minDollar || 0)) {
           trades.push({
-            signature: tx.signature,
-            type: 'external-sell',
-            tokenAmount,
-            dollarAmount: netQuoteOut,
-            trader: feePayer,
-            timestamp: tx.timestamp || 0,
+            signature: tx.signature, type: 'external-sell',
+            tokenAmount, quoteAmount: netQuoteOut, dollarAmount,
+            trader: feePayer, timestamp: tx.timestamp || 0, pool,
           });
         }
       }
@@ -180,10 +258,11 @@ export async function POST(request: Request) {
 
     console.log('[CM] Detected', trades.length, 'trades above threshold');
 
-    // Step 4: Execute counter-trades
+    // Step 5: Execute counter-trades
 
     for (const trade of trades) {
       const eventId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const poolLabel = trade.pool === pool2 ? '[SOL]' : '[USDC]';
 
       events.push({
         id: `det-${eventId}`,
@@ -192,34 +271,25 @@ export async function POST(request: Request) {
         tokenAmount: trade.tokenAmount,
         dollarAmount: trade.dollarAmount,
         signature: trade.signature,
-        message: `${trade.type === 'external-buy' ? 'Buy' : 'Sell'} detected: ${trade.tokenAmount.toLocaleString()} tokens ($${trade.dollarAmount.toFixed(2)}) by ${trade.trader.slice(0, 8)}...`,
+        message: `${poolLabel} ${trade.type === 'external-buy' ? 'Buy' : 'Sell'} detected: ${trade.tokenAmount.toLocaleString()} tokens ($${trade.dollarAmount.toFixed(2)}) by ${trade.trader.slice(0, 8)}...`,
       });
 
       // Counter-sell on external buy
       if (trade.type === 'external-buy' && (mode === 'sell-on-buy' || mode === 'both')) {
         if (!sellWallets || sellWallets.length === 0) {
           events.push({
-            id: `skip-${eventId}`,
-            timestamp: new Date().toISOString(),
-            type: 'skip',
-            tokenAmount: trade.tokenAmount,
-            dollarAmount: trade.dollarAmount,
-            signature: trade.signature,
+            id: `skip-${eventId}`, timestamp: new Date().toISOString(), type: 'skip',
+            tokenAmount: trade.tokenAmount, dollarAmount: trade.dollarAmount, signature: trade.signature,
             message: 'No wallets with tokens available for counter-sell',
           });
           continue;
         }
 
-        const eligible = sellWallets
-          .filter((w: WalletEntry) => w.tokenBalance >= trade.tokenAmount);
+        const eligible = sellWallets.filter((w: WalletEntry) => w.tokenBalance >= trade.tokenAmount);
         if (eligible.length === 0) {
           events.push({
-            id: `skip-${eventId}`,
-            timestamp: new Date().toISOString(),
-            type: 'skip',
-            tokenAmount: trade.tokenAmount,
-            dollarAmount: trade.dollarAmount,
-            signature: trade.signature,
+            id: `skip-${eventId}`, timestamp: new Date().toISOString(), type: 'skip',
+            tokenAmount: trade.tokenAmount, dollarAmount: trade.dollarAmount, signature: trade.signature,
             message: `No wallets with enough tokens (need ≥${Math.ceil(trade.tokenAmount).toLocaleString()} tokens)`,
           });
           continue;
@@ -229,75 +299,55 @@ export async function POST(request: Request) {
         const sellAmount = Math.min(trade.tokenAmount, wallet.tokenBalance);
 
         try {
-          const result = useJupiter
-            ? await sellViaRaydium(connection, poolAddress, poolInfo.type, tokenMint, quoteMint, wallet, sellAmount, slippageBps || 100, tokenDecimals || 6)
-            : await sellExactTokenAmount(connection, poolAddress, tokenMint, wallet, sellAmount, slippageBps || 100, tokenDecimals || 6);
+          const result = await executeSell(connection, trade.pool, tokenMint, wallet, sellAmount, slippageBps || 100, tokenDecimals || 6);
 
           if (result.signature) {
             wallet.tokenBalance -= result.amountSold;
             events.push({
-              id: `sell-${eventId}`,
-              timestamp: new Date().toISOString(),
-              type: 'counter-sell',
-              tokenAmount: result.amountSold,
-              dollarAmount: result.quoteReceived || 0,
-              signature: trade.signature,
-              counterSignature: result.signature,
+              id: `sell-${eventId}`, timestamp: new Date().toISOString(), type: 'counter-sell',
+              tokenAmount: result.amountSold, dollarAmount: result.quoteReceived || 0,
+              signature: trade.signature, counterSignature: result.signature,
               wallet: wallet.publicKey.slice(0, 8),
-              message: `Counter-sold ${result.amountSold.toLocaleString()} tokens via ${wallet.label || wallet.publicKey.slice(0, 8)}`,
+              message: `${poolLabel} Counter-sold ${result.amountSold.toLocaleString()} tokens via ${wallet.label || wallet.publicKey.slice(0, 8)}`,
             });
           } else {
             events.push({
-              id: `err-${eventId}`,
-              timestamp: new Date().toISOString(),
-              type: 'error',
-              tokenAmount: trade.tokenAmount,
-              dollarAmount: trade.dollarAmount,
-              signature: trade.signature,
-              message: `Counter-sell failed: ${result.error}`,
+              id: `err-${eventId}`, timestamp: new Date().toISOString(), type: 'error',
+              tokenAmount: trade.tokenAmount, dollarAmount: trade.dollarAmount, signature: trade.signature,
+              message: `${poolLabel} Counter-sell failed: ${result.error}`,
             });
           }
         } catch (err) {
           events.push({
-            id: `err-${eventId}`,
-            timestamp: new Date().toISOString(),
-            type: 'error',
-            tokenAmount: trade.tokenAmount,
-            dollarAmount: trade.dollarAmount,
-            signature: trade.signature,
-            message: `Counter-sell error: ${(err as Error).message}`,
+            id: `err-${eventId}`, timestamp: new Date().toISOString(), type: 'error',
+            tokenAmount: trade.tokenAmount, dollarAmount: trade.dollarAmount, signature: trade.signature,
+            message: `${poolLabel} Counter-sell error: ${(err as Error).message}`,
           });
         }
       }
 
-      // Counter-buy on external sell
-      if (trade.type === 'external-sell' && (mode === 'buy-on-sell' || mode === 'both')) {
+      // Counter-buy on external sell (pool1 only)
+      if (trade.type === 'external-sell' && trade.pool !== pool2 && (mode === 'buy-on-sell' || mode === 'both')) {
         const buyWallets = (body.buyWallets || []) as WalletEntry[];
-        const eligible = buyWallets.filter((w: WalletEntry) => (w.usdcBalance || 0) > 0.001).sort((a: WalletEntry, b: WalletEntry) => b.usdcBalance - a.usdcBalance);
+        const eligible = trade.pool.quoteIsSOL
+          ? buyWallets.filter((w: WalletEntry) => (w.solBalance || 0) > 0.01).sort((a: WalletEntry, b: WalletEntry) => (b.solBalance || 0) - (a.solBalance || 0))
+          : buyWallets.filter((w: WalletEntry) => (w.usdcBalance || 0) > 0.001).sort((a: WalletEntry, b: WalletEntry) => b.usdcBalance - a.usdcBalance);
 
         if (eligible.length === 0) {
           events.push({
-            id: `skip-${eventId}`,
-            timestamp: new Date().toISOString(),
-            type: 'skip',
-            tokenAmount: trade.tokenAmount,
-            dollarAmount: trade.dollarAmount,
-            signature: trade.signature,
-            message: 'No wallets with USDC available for counter-buy',
+            id: `skip-${eventId}`, timestamp: new Date().toISOString(), type: 'skip',
+            tokenAmount: trade.tokenAmount, dollarAmount: trade.dollarAmount, signature: trade.signature,
+            message: 'No wallets with quote available for counter-buy',
           });
           continue;
         }
 
-        let remaining = trade.dollarAmount;
+        let remaining = trade.quoteAmount;
         if (remaining <= 0) {
           events.push({
-            id: `skip-${eventId}`,
-            timestamp: new Date().toISOString(),
-            type: 'skip',
-            tokenAmount: trade.tokenAmount,
-            dollarAmount: 0,
-            signature: trade.signature,
-            message: 'Could not determine dollar amount for counter-buy',
+            id: `skip-${eventId}`, timestamp: new Date().toISOString(), type: 'skip',
+            tokenAmount: trade.tokenAmount, dollarAmount: 0, signature: trade.signature,
+            message: 'Could not determine quote amount for counter-buy',
           });
           continue;
         }
@@ -305,98 +355,95 @@ export async function POST(request: Request) {
         for (const wallet of eligible) {
           if (remaining <= 0.001) break;
 
-          const spendAmount = Math.min(remaining, wallet.usdcBalance || 0);
+          const available = trade.pool.quoteIsSOL ? wallet.solBalance || 0 : wallet.usdcBalance || 0;
+          const spendAmount = Math.min(remaining, available);
           if (spendAmount < 0.001) continue;
 
           try {
-            const result = useJupiter
-              ? await buyViaRaydium(connection, poolAddress, poolInfo.type, tokenMint, quoteMint, wallet, spendAmount, slippageBps || 100, tokenDecimals || 6)
-              : await buyTokensForWallet(connection, poolAddress, tokenMint, wallet, spendAmount, slippageBps || 100, tokenDecimals || 6);
+            const result = await executeBuy(connection, trade.pool, tokenMint, wallet, spendAmount, slippageBps || 100, tokenDecimals || 6);
 
             if (result.signature) {
               remaining -= result.quoteSpent;
-              wallet.usdcBalance = Math.max(0, (wallet.usdcBalance || 0) - result.quoteSpent);
+              if (trade.pool.quoteIsSOL) {
+                wallet.solBalance = Math.max(0, (wallet.solBalance || 0) - result.quoteSpent);
+              } else {
+                wallet.usdcBalance = Math.max(0, (wallet.usdcBalance || 0) - result.quoteSpent);
+              }
               events.push({
-                id: `buy-${eventId}-${wallet.publicKey.slice(0, 6)}`,
-                timestamp: new Date().toISOString(),
-                type: 'counter-buy',
-                tokenAmount: result.tokensReceived,
-                dollarAmount: result.quoteSpent,
-                signature: trade.signature,
-                counterSignature: result.signature,
+                id: `buy-${eventId}-${wallet.publicKey.slice(0, 6)}`, timestamp: new Date().toISOString(), type: 'counter-buy',
+                tokenAmount: result.tokensReceived, dollarAmount: result.quoteSpent,
+                signature: trade.signature, counterSignature: result.signature,
                 wallet: wallet.publicKey.slice(0, 8),
-                message: `Counter-bought ${result.tokensReceived.toLocaleString()} tokens for ${result.quoteSpent.toFixed(2)} ${result.quoteSymbol} via ${wallet.label || wallet.publicKey.slice(0, 8)}`,
+                message: `${poolLabel} Counter-bought ${result.tokensReceived.toLocaleString()} tokens for ${result.quoteSpent.toFixed(4)} ${result.quoteSymbol} via ${wallet.label || wallet.publicKey.slice(0, 8)}`,
               });
             } else {
               events.push({
-                id: `err-${eventId}-${wallet.publicKey.slice(0, 6)}`,
-                timestamp: new Date().toISOString(),
-                type: 'error',
-                tokenAmount: trade.tokenAmount,
-                dollarAmount: spendAmount,
-                signature: trade.signature,
-                message: `Counter-buy failed on ${wallet.label || wallet.publicKey.slice(0, 8)}: ${result.error}`,
+                id: `err-${eventId}-${wallet.publicKey.slice(0, 6)}`, timestamp: new Date().toISOString(), type: 'error',
+                tokenAmount: trade.tokenAmount, dollarAmount: spendAmount, signature: trade.signature,
+                message: `${poolLabel} Counter-buy failed on ${wallet.label || wallet.publicKey.slice(0, 8)}: ${result.error}`,
               });
             }
           } catch (err) {
             events.push({
-              id: `err-${eventId}-${wallet.publicKey.slice(0, 6)}`,
-              timestamp: new Date().toISOString(),
-              type: 'error',
-              tokenAmount: trade.tokenAmount,
-              dollarAmount: spendAmount,
-              signature: trade.signature,
-              message: `Counter-buy error on ${wallet.label || wallet.publicKey.slice(0, 8)}: ${(err as Error).message}`,
+              id: `err-${eventId}-${wallet.publicKey.slice(0, 6)}`, timestamp: new Date().toISOString(), type: 'error',
+              tokenAmount: trade.tokenAmount, dollarAmount: spendAmount, signature: trade.signature,
+              message: `${poolLabel} Counter-buy error on ${wallet.label || wallet.publicKey.slice(0, 8)}: ${(err as Error).message}`,
             });
           }
         }
 
         if (remaining > 0.01) {
           events.push({
-            id: `warn-${eventId}`,
-            timestamp: new Date().toISOString(),
-            type: 'skip',
-            tokenAmount: 0,
-            dollarAmount: remaining,
-            signature: trade.signature,
-            message: `Insufficient USDC across all wallets — $${remaining.toFixed(2)} not covered`,
+            id: `warn-${eventId}`, timestamp: new Date().toISOString(), type: 'skip',
+            tokenAmount: 0, dollarAmount: remaining, signature: trade.signature,
+            message: `${poolLabel} Insufficient quote across all wallets — ${remaining.toFixed(4)} not covered`,
           });
         }
       }
     }
 
-    // Bonus micro-buy after each successful counter-trade
+    // Bonus micro-buy after each successful counter-trade (on both pools)
     const allBuyWallets = (body.buyWallets || []) as WalletEntry[];
     const counterEvents = events.filter(e => (e.type === 'counter-sell' || e.type === 'counter-buy') && e.counterSignature);
 
     for (const ce of counterEvents) {
-      const microAmount = 1 + Math.random() * 2; // $1-$3
+      const microDollar = 1 + Math.random() * 2; // $1-$3
+      const isPool2Event = ce.message?.startsWith('[SOL]');
+      const microPool = (isPool2Event && pool2) ? pool2 : pool1;
+      const microIsSOL = microPool.quoteIsSOL;
+      const microAmount = microIsSOL ? microDollar / solPrice : microDollar;
+
       const eligible = allBuyWallets
-        .filter((w: WalletEntry) => (w.usdcBalance || 0) >= microAmount && w.publicKey.slice(0, 8) !== ce.wallet)
+        .filter((w: WalletEntry) => {
+          if (w.publicKey.slice(0, 8) === ce.wallet) return false;
+          return microIsSOL
+            ? (w.solBalance || 0) >= microAmount
+            : (w.usdcBalance || 0) >= microAmount;
+        })
         .sort(() => Math.random() - 0.5);
 
       if (eligible.length === 0) continue;
 
       const microWallet = eligible[0];
       const microId = `micro-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      const poolLabel = microPool === pool2 ? '[SOL]' : '[USDC]';
 
       try {
-        const result = useJupiter
-          ? await buyViaRaydium(connection, poolAddress, poolInfo.type, tokenMint, quoteMint, microWallet, microAmount, slippageBps || 100, tokenDecimals || 6)
-          : await buyTokensForWallet(connection, poolAddress, tokenMint, microWallet, microAmount, slippageBps || 100, tokenDecimals || 6);
+        const result = await executeBuy(connection, microPool, tokenMint, microWallet, microAmount, slippageBps || 100, tokenDecimals || 6);
 
         if (result.signature) {
-          microWallet.usdcBalance = Math.max(0, (microWallet.usdcBalance || 0) - result.quoteSpent);
+          if (microIsSOL) {
+            microWallet.solBalance = Math.max(0, (microWallet.solBalance || 0) - result.quoteSpent);
+          } else {
+            microWallet.usdcBalance = Math.max(0, (microWallet.usdcBalance || 0) - result.quoteSpent);
+          }
+          const displayAmount = microIsSOL ? `${result.quoteSpent.toFixed(4)} SOL (~$${(result.quoteSpent * solPrice).toFixed(2)})` : `$${result.quoteSpent.toFixed(2)}`;
           events.push({
-            id: microId,
-            timestamp: new Date().toISOString(),
-            type: 'counter-buy',
-            tokenAmount: result.tokensReceived,
-            dollarAmount: result.quoteSpent,
-            signature: ce.counterSignature!,
-            counterSignature: result.signature,
+            id: microId, timestamp: new Date().toISOString(), type: 'counter-buy',
+            tokenAmount: result.tokensReceived, dollarAmount: microIsSOL ? result.quoteSpent * solPrice : result.quoteSpent,
+            signature: ce.counterSignature!, counterSignature: result.signature,
             wallet: microWallet.publicKey.slice(0, 8),
-            message: `Micro-buy $${result.quoteSpent.toFixed(2)} via ${microWallet.label || microWallet.publicKey.slice(0, 8)}`,
+            message: `${poolLabel} Micro-buy ${displayAmount} via ${microWallet.label || microWallet.publicKey.slice(0, 8)}`,
           });
         }
       } catch {}
@@ -407,6 +454,7 @@ export async function POST(request: Request) {
       data: {
         events,
         lastSignature: newLastSig,
+        lastSignature2: newLastSig2,
         tradesDetected: trades.length,
       },
     });
