@@ -21,6 +21,26 @@ import type { WalletEntry, BuyResult } from '@/types';
 
 const SPL_TOKEN_PROGRAM = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 
+async function confirmTxGeneric(connection: Connection, signature: string, timeoutMs = 15000): Promise<{ confirmed: boolean; error?: string }> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const resp = await connection.getSignatureStatuses([signature]);
+      const status = resp.value[0];
+      if (status) {
+        if (status.err) {
+          return { confirmed: false, error: `Transaction failed on-chain: ${JSON.stringify(status.err)}` };
+        }
+        if (status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized') {
+          return { confirmed: true };
+        }
+      }
+    } catch {}
+    await new Promise(r => setTimeout(r, 1500));
+  }
+  return { confirmed: false, error: 'Transaction confirmation timeout' };
+}
+
 /** Detect if a token mint uses SPL standard or Token-2022 */
 async function detectTokenProgram(connection: Connection, mint: PublicKey): Promise<PublicKey> {
   const info = await connection.getAccountInfo(mint);
@@ -715,13 +735,12 @@ export async function sellExactTokenAmount(
   poolAddress: string,
   tokenMint: string,
   wallet: WalletEntry,
-  tokenAmount: number,      // human-readable token amount to sell
+  tokenAmount: number,
   slippageBps: number,
   decimals: number
 ): Promise<SellResult> {
   const pool = new PublicKey(poolAddress);
   const mint = new PublicKey(tokenMint);
-  const tokenProgram = await detectTokenProgram(connection, mint);
   const cpAmm = new CpAmm(connection as any);
 
   const USDC_MINTS = [
@@ -734,11 +753,26 @@ export async function sellExactTokenAmount(
 
   try {
     const keypair = Keypair.fromSecretKey(bs58.decode(wallet.privateKey));
-    const ata = getAssociatedTokenAddressSync(
-      mint, keypair.publicKey, false, tokenProgram
-    );
 
-    // Get balance and cap if needed
+    // Parallel batch 1: tokenProgram + poolState + slot + blockhash
+    const [tokenProgram, activePoolState, currentSlot, latestBlock] = await Promise.all([
+      detectTokenProgram(connection, mint),
+      cpAmm.fetchPoolState(pool),
+      connection.getSlot(),
+      connection.getLatestBlockhash('confirmed'),
+    ]);
+
+    const ata = getAssociatedTokenAddressSync(mint, keypair.publicKey, false, tokenProgram);
+
+    const tokenBMintStr = activePoolState.tokenBMint.toBase58();
+    if (USDC_MINTS.includes(tokenBMintStr)) {
+      quoteBDecimals = 6;
+      quoteSymbol = 'USDC';
+    } else if (tokenBMintStr === WSOL_MINT) {
+      quoteBDecimals = 9;
+      quoteSymbol = 'SOL';
+    }
+
     let balance: bigint;
     try {
       const account = await getAccount(connection, ata, 'confirmed', tokenProgram);
@@ -753,123 +787,60 @@ export async function sellExactTokenAmount(
     }
 
     if (balance === BigInt(0)) {
-      return {
-        walletId: wallet.id,
-        walletPublicKey: wallet.publicKey,
-        error: 'Zero balance',
-        amountSold: 0,
-      };
+      return { walletId: wallet.id, walletPublicKey: wallet.publicKey, error: 'Zero balance', amountSold: 0 };
     }
 
-    // Convert human-readable tokenAmount to raw
     let rawSellAmount = BigInt(Math.floor(tokenAmount * 10 ** decimals));
-    // Cap at available balance
-    if (rawSellAmount > balance) {
-      rawSellAmount = balance;
-    }
+    if (rawSellAmount > balance) rawSellAmount = balance;
     if (rawSellAmount === BigInt(0)) {
-      return {
-        walletId: wallet.id,
-        walletPublicKey: wallet.publicKey,
-        error: 'Amount too small',
-        amountSold: 0,
-      };
+      return { walletId: wallet.id, walletPublicKey: wallet.publicKey, error: 'Amount too small', amountSold: 0 };
     }
 
     let swapAmount = new BN(rawSellAmount.toString());
     const slippage = slippageBps / 10000;
-
-    let activePoolState = await cpAmm.fetchPoolState(pool);
-    const tokenBMintStr = activePoolState.tokenBMint.toBase58();
-    if (USDC_MINTS.includes(tokenBMintStr)) {
-      quoteBDecimals = 6;
-      quoteSymbol = 'USDC';
-    } else if (tokenBMintStr === WSOL_MINT) {
-      quoteBDecimals = 9;
-      quoteSymbol = 'SOL';
-    }
+    const currentTime = Math.floor(Date.now() / 1000);
 
     let quote;
-
-    console.log('[CM-sell] Starting quote. tokenAmount:', tokenAmount,
-      'rawSellAmount:', rawSellAmount.toString(), 'decimals:', decimals,
-      'quoteBDecimals:', quoteBDecimals, 'slippage:', slippage);
-
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const currentSlot = await connection.getSlot();
-      let currentTime = Math.floor(Date.now() / 1000);
-      try {
-        const bt = await connection.getBlockTime(currentSlot - 2);
-        if (bt) currentTime = bt;
-      } catch {}
-
-      if (attempt > 0) {
-        await new Promise(r => setTimeout(r, 500));
-        activePoolState = await cpAmm.fetchPoolState(pool);
-      }
-
-      console.log('[CM-sell] attempt', attempt, 'slot:', currentSlot, 'time:', currentTime,
-        'swapAmount:', swapAmount.toString(),
-        'poolTokenA:', activePoolState.tokenAMint.toBase58().slice(0, 8),
-        'poolTokenB:', activePoolState.tokenBMint.toBase58().slice(0, 8));
-
-      try {
-        quote = cpAmm.getQuote({
-          inAmount: swapAmount,
-          inputTokenMint: activePoolState.tokenAMint,
-          slippage,
-          poolState: activePoolState,
-          currentTime,
-          currentSlot,
-          tokenADecimal: decimals,
-          tokenBDecimal: quoteBDecimals,
-        });
-        break;
-      } catch (quoteErr) {
-        const errMsg = (quoteErr as Error).message;
-        if (errMsg.includes('Price range is violated') || errMsg.includes('Amount out must be greater')) {
-          const maxResult = findMaxSellable(
-            cpAmm, activePoolState, activePoolState.tokenAMint, swapAmount,
-            slippage, currentTime, currentSlot, decimals, quoteBDecimals
-          );
-          if (maxResult) {
-            swapAmount = maxResult.maxAmount;
-            quote = maxResult.quote;
-            rawSellAmount = BigInt(swapAmount.toString());
-            break;
-          }
-          if (attempt === 2) {
-            throw new Error(`Quote failed (slot:${currentSlot} amount:${swapAmount.toString()} dec:${decimals}/${quoteBDecimals} slip:${slippage}): ${errMsg}`);
-          }
+    try {
+      quote = cpAmm.getQuote({
+        inAmount: swapAmount, inputTokenMint: activePoolState.tokenAMint, slippage,
+        poolState: activePoolState, currentTime, currentSlot,
+        tokenADecimal: decimals, tokenBDecimal: quoteBDecimals,
+      });
+    } catch (quoteErr) {
+      const errMsg = (quoteErr as Error).message;
+      if (errMsg.includes('Price range is violated') || errMsg.includes('Amount out must be greater')) {
+        const maxResult = findMaxSellable(
+          cpAmm, activePoolState, activePoolState.tokenAMint, swapAmount,
+          slippage, currentTime, currentSlot, decimals, quoteBDecimals
+        );
+        if (maxResult) {
+          swapAmount = maxResult.maxAmount;
+          quote = maxResult.quote;
+          rawSellAmount = BigInt(swapAmount.toString());
         } else {
-          throw quoteErr;
+          throw new Error('Pool has no liquidity for this swap');
         }
+      } else {
+        throw quoteErr;
       }
     }
-    if (!quote) throw new Error('Failed to get swap quote after retries');
+    if (!quote) throw new Error('Failed to get swap quote');
 
     const swapTx = await cpAmm.swap({
-      payer: keypair.publicKey,
-      pool,
+      payer: keypair.publicKey, pool,
       inputTokenMint: activePoolState.tokenAMint,
       outputTokenMint: activePoolState.tokenBMint,
-      amountIn: swapAmount,
-      minimumAmountOut: quote.minSwapOutAmount,
-      tokenAMint: activePoolState.tokenAMint,
-      tokenBMint: activePoolState.tokenBMint,
-      tokenAVault: activePoolState.tokenAVault,
-      tokenBVault: activePoolState.tokenBVault,
+      amountIn: swapAmount, minimumAmountOut: new BN(0),
+      tokenAMint: activePoolState.tokenAMint, tokenBMint: activePoolState.tokenBMint,
+      tokenAVault: activePoolState.tokenAVault, tokenBVault: activePoolState.tokenBVault,
       tokenAProgram: activePoolState.tokenAFlag ? TOKEN_2022_PROGRAM_ID : new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
       tokenBProgram: (activePoolState as any).tokenBFlag ? TOKEN_2022_PROGRAM_ID : new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
       referralTokenAccount: null,
     });
 
-    (swapTx as any).add(
-      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 })
-    );
-
-    const { blockhash } = await connection.getLatestBlockhash('confirmed');
-    (swapTx as any).recentBlockhash = blockhash;
+    (swapTx as any).add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }));
+    (swapTx as any).recentBlockhash = latestBlock.blockhash;
     (swapTx as any).feePayer = keypair.publicKey;
     (swapTx as any).sign(keypair);
 
@@ -1568,5 +1539,142 @@ export async function buyViaRaydium(
     };
   } catch (err) {
     return { walletId: wallet.id, walletPublicKey: wallet.publicKey, error: (err as Error).message, quoteSpent: 0, tokensReceived: 0, quoteSymbol: qSym };
+  }
+}
+
+// ─── DLMM buy/sell ───
+
+export async function sellViaDlmm(
+  connection: Connection,
+  poolAddress: string,
+  tokenMint: string,
+  quoteMint: string,
+  wallet: WalletEntry,
+  tokenAmount: number,
+  slippageBps: number,
+  tokenDecimals: number,
+): Promise<SellResult> {
+  const qDec = getQuoteDecimals(quoteMint);
+  const qSym = getQuoteSymbol(quoteMint);
+  try {
+    const keypair = Keypair.fromSecretKey(bs58.decode(wallet.privateKey));
+    const DLMM = (await import('@meteora-ag/dlmm')).default;
+    const dlmmPool = await DLMM.create(connection as any, new PublicKey(poolAddress));
+
+    const tokenMintX = dlmmPool.lbPair.tokenXMint.toBase58();
+    const swapForY = tokenMintX === tokenMint;
+    const rawAmount = new BN(Math.floor(tokenAmount * 10 ** tokenDecimals).toString());
+
+    const binArrays = await dlmmPool.getBinArrayForSwap(swapForY);
+    const quote = dlmmPool.swapQuote(rawAmount, swapForY, new BN(slippageBps), binArrays);
+
+    const swapTx = await dlmmPool.swap({
+      inToken: new PublicKey(tokenMint),
+      outToken: new PublicKey(quoteMint),
+      inAmount: rawAmount,
+      minOutAmount: quote.minOutAmount,
+      lbPair: new PublicKey(poolAddress),
+      user: keypair.publicKey,
+      binArraysPubkey: quote.binArraysPubkey,
+    });
+
+    const tx = swapTx instanceof Transaction ? swapTx : swapTx as Transaction;
+    tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }));
+    const { blockhash } = await connection.getLatestBlockhash('confirmed');
+    tx.recentBlockhash = blockhash;
+    tx.feePayer = keypair.publicKey;
+    tx.sign(keypair);
+
+    const sig = await connection.sendRawTransaction(tx.serialize(), {
+      skipPreflight: true,
+      maxRetries: 5,
+    });
+
+    const quoteReceived = Number(quote.minOutAmount.toString()) / 10 ** qDec;
+
+    return {
+      walletId: wallet.id,
+      walletPublicKey: wallet.publicKey,
+      signature: sig,
+      amountSold: tokenAmount,
+      quoteReceived,
+      quoteSymbol: qSym,
+    };
+  } catch (err) {
+    return {
+      walletId: wallet.id,
+      walletPublicKey: wallet.publicKey,
+      error: (err as Error).message,
+      amountSold: 0,
+    };
+  }
+}
+
+export async function buyViaDlmm(
+  connection: Connection,
+  poolAddress: string,
+  tokenMint: string,
+  quoteMint: string,
+  wallet: WalletEntry,
+  quoteAmount: number,
+  slippageBps: number,
+  tokenDecimals: number,
+): Promise<BuyResult> {
+  const qDec = getQuoteDecimals(quoteMint);
+  const qSym = getQuoteSymbol(quoteMint);
+  const WSOL = 'So11111111111111111111111111111111111111112';
+  try {
+    const keypair = Keypair.fromSecretKey(bs58.decode(wallet.privateKey));
+    const DLMM = (await import('@meteora-ag/dlmm')).default;
+    const dlmmPool = await DLMM.create(connection as any, new PublicKey(poolAddress));
+
+    const tokenMintX = dlmmPool.lbPair.tokenXMint.toBase58();
+    const swapForY = tokenMintX !== tokenMint;
+    const rawQuoteAmount = new BN(Math.floor(quoteAmount * 10 ** qDec).toString());
+
+    const binArrays = await dlmmPool.getBinArrayForSwap(swapForY);
+    const quote = dlmmPool.swapQuote(rawQuoteAmount, swapForY, new BN(slippageBps), binArrays);
+
+    const swapTx = await dlmmPool.swap({
+      inToken: new PublicKey(quoteMint),
+      outToken: new PublicKey(tokenMint),
+      inAmount: rawQuoteAmount,
+      minOutAmount: quote.minOutAmount,
+      lbPair: new PublicKey(poolAddress),
+      user: keypair.publicKey,
+      binArraysPubkey: quote.binArraysPubkey,
+    });
+
+    const tx = swapTx instanceof Transaction ? swapTx : swapTx as Transaction;
+    tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }));
+    const { blockhash } = await connection.getLatestBlockhash('confirmed');
+    tx.recentBlockhash = blockhash;
+    tx.feePayer = keypair.publicKey;
+    tx.sign(keypair);
+
+    const sig = await connection.sendRawTransaction(tx.serialize(), {
+      skipPreflight: true,
+      maxRetries: 5,
+    });
+
+    const tokensReceived = Number(quote.outAmount.toString()) / 10 ** tokenDecimals;
+
+    return {
+      walletId: wallet.id,
+      walletPublicKey: wallet.publicKey,
+      signature: sig,
+      quoteSpent: quoteAmount,
+      tokensReceived,
+      quoteSymbol: qSym,
+    };
+  } catch (err) {
+    return {
+      walletId: wallet.id,
+      walletPublicKey: wallet.publicKey,
+      error: (err as Error).message,
+      quoteSpent: 0,
+      tokensReceived: 0,
+      quoteSymbol: qSym,
+    };
   }
 }

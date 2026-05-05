@@ -4,7 +4,8 @@ import { sellExactTokenAmount, buyTokensForWallet, sellViaRaydium, buyViaRaydium
 import { getPoolInfo, isRaydiumPool, isDlmmPool, getQuoteMint } from '@/lib/pool-utils';
 import type { PoolInfo } from '@/lib/pool-utils';
 import type { WalletEntry } from '@/types';
-import { PublicKey } from '@solana/web3.js';
+import { PublicKey, Keypair, VersionedTransaction, LAMPORTS_PER_SOL } from '@solana/web3.js';
+import bs58 from 'bs58';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
@@ -52,13 +53,70 @@ interface ChartManagerEvent {
 
 async function fetchSolPrice(): Promise<number> {
   try {
-    const res = await fetch('https://api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112');
+    const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
     if (res.ok) {
       const data = await res.json();
-      return parseFloat(data.data?.[WSOL_MINT]?.price || '0');
+      const price = data?.solana?.usd;
+      if (price && price > 0) return price;
     }
   } catch {}
-  return 150;
+  try {
+    const res = await fetch(`https://api.jup.ag/price/v2?ids=${WSOL_MINT}`);
+    if (res.ok) {
+      const data = await res.json();
+      const price = parseFloat(data.data?.[WSOL_MINT]?.price || '0');
+      if (price > 0) return price;
+    }
+  } catch {}
+  return 84;
+}
+
+const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
+const RPC_URL = process.env.NEXT_PUBLIC_RPC_URL || 'https://api.mainnet-beta.solana.com';
+
+async function jupiterSwapSolToUsdc(wallet: WalletEntry, solAmount: number): Promise<{ signature: string; usdcReceived: number }> {
+  const amountLamports = Math.round(solAmount * LAMPORTS_PER_SOL);
+  if (amountLamports < 10000) throw new Error('SOL amount too small to swap');
+
+  const quoteRes = await fetch(`https://lite-api.jup.ag/swap/v1/quote?inputMint=${SOL_MINT}&outputMint=${USDC_MINT}&amount=${amountLamports}&slippageBps=300`);
+  if (!quoteRes.ok) throw new Error(`Jupiter quote failed: ${await quoteRes.text()}`);
+  const quote = await quoteRes.json();
+
+  let kp: Keypair;
+  try { kp = Keypair.fromSecretKey(bs58.decode(wallet.privateKey)); }
+  catch { kp = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(wallet.privateKey))); }
+
+  const swapRes = await fetch('https://lite-api.jup.ag/swap/v1/swap', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ quoteResponse: quote, userPublicKey: kp.publicKey.toBase58(), wrapAndUnwrapSol: true, prioritizationFeeLamports: 'auto' }),
+  });
+  if (!swapRes.ok) throw new Error(`Jupiter swap failed: ${await swapRes.text()}`);
+  const swapData = await swapRes.json();
+
+  const { Connection } = await import('@solana/web3.js');
+  const conn = new Connection(RPC_URL, 'confirmed');
+  const txBuf = Buffer.from(swapData.swapTransaction, 'base64');
+  const tx = VersionedTransaction.deserialize(txBuf);
+  tx.sign([kp]);
+
+  let sig: string | null = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 3 });
+      await conn.confirmTransaction(sig, 'confirmed');
+      break;
+    } catch (e) {
+      if (attempt === 2) throw e;
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+  if (!sig) throw new Error('Failed to send swap transaction');
+
+  const usdcReceived = parseInt(quote.outAmount) / 1_000_000;
+  console.log(`[CM] Auto-swap: ${solAmount.toFixed(4)} SOL → ${usdcReceived.toFixed(2)} USDC (${sig})`);
+  return { signature: sig, usdcReceived };
 }
 
 function buildPoolContext(poolAddress: string, poolInfo: PoolInfo, tokenMint: string): PoolContext {
@@ -117,6 +175,7 @@ export async function POST(request: Request) {
     const connection = getConnection(network || 'mainnet-beta');
     const ownWalletSet = new Set<string>(ownWallets || []);
     const ownSigSet = new Set<string>(body.ownSignatures || []);
+    const processedTradesSet = new Set<string>(body.processedTrades || []);
     const events: ChartManagerEvent[] = [];
 
     // Build pool contexts
@@ -136,24 +195,41 @@ export async function POST(request: Request) {
       console.log('[CM] SOL price:', solPrice);
     }
 
-    // Step 1: Get new signatures from pool 1
+    // Step 1: Get new signatures from pool 1 (since lastSignature)
     const sigParams1: any = { limit: 50 };
     if (lastSignature) sigParams1.until = lastSignature;
 
     const signatures1 = await connection.getSignaturesForAddress(new PublicKey(poolAddress), sigParams1);
     let newLastSig = signatures1.length > 0 ? signatures1[0].signature : (lastSignature || null);
 
+    // Also fetch last 20 as safety net to catch missed signatures (only keep those newer than lastSignature)
+    let safetyNet1: any[] = [];
+    if (lastSignature) {
+      const raw = await connection.getSignaturesForAddress(new PublicKey(poolAddress), { limit: 20 });
+      const cutoff = raw.findIndex((s: any) => s.signature === lastSignature);
+      safetyNet1 = cutoff >= 0 ? raw.slice(0, cutoff) : [];
+      if (safetyNet1.length > 0) newLastSig = safetyNet1[0].signature;
+    }
+
     // Get new signatures from pool 2
     let newLastSig2 = lastSignature2 || null;
     let signatures2: any[] = [];
+    let safetyNet2: any[] = [];
     if (pool2) {
       const sigParams2: any = { limit: 50 };
       if (lastSignature2) sigParams2.until = lastSignature2;
       signatures2 = await connection.getSignaturesForAddress(new PublicKey(poolAddress2.trim()), sigParams2);
       if (signatures2.length > 0) newLastSig2 = signatures2[0].signature;
+
+      if (lastSignature2) {
+        const raw2 = await connection.getSignaturesForAddress(new PublicKey(poolAddress2.trim()), { limit: 20 });
+        const cutoff2 = raw2.findIndex((s: any) => s.signature === lastSignature2);
+        safetyNet2 = cutoff2 >= 0 ? raw2.slice(0, cutoff2) : [];
+        if (safetyNet2.length > 0) newLastSig2 = safetyNet2[0].signature;
+      }
     }
 
-    const totalSigs = signatures1.length + signatures2.length;
+    const totalSigs = signatures1.length + signatures2.length + safetyNet1.length + safetyNet2.length;
 
     if (totalSigs === 0) {
       return NextResponse.json({
@@ -163,9 +239,9 @@ export async function POST(request: Request) {
     }
 
     // First poll baseline
-    if (!lastSignature && signatures1.length > 0) {
+    if (!lastSignature && (signatures1.length > 0 || safetyNet1.length > 0)) {
       console.log('[CM] First poll — baseline pool1:', newLastSig?.slice(0, 12));
-      if (!lastSignature2 && signatures2.length > 0) {
+      if (!lastSignature2 && (signatures2.length > 0 || safetyNet2.length > 0)) {
         console.log('[CM] First poll — baseline pool2:', newLastSig2?.slice(0, 12));
       }
       return NextResponse.json({
@@ -174,19 +250,33 @@ export async function POST(request: Request) {
       });
     }
 
-    // Step 2: Merge and deduplicate signatures, tag with pool
+    // Step 2: Merge and deduplicate signatures, tag with pool — skip already-processed everywhere
     const sigPoolMap = new Map<string, PoolContext>();
     for (const s of signatures1) {
-      if (lastSignature) sigPoolMap.set(s.signature, pool1);
+      if (lastSignature && !processedTradesSet.has(s.signature)) {
+        sigPoolMap.set(s.signature, pool1);
+      }
+    }
+    for (const s of safetyNet1) {
+      if (!sigPoolMap.has(s.signature) && !processedTradesSet.has(s.signature)) {
+        sigPoolMap.set(s.signature, pool1);
+      }
     }
     if (pool2 && lastSignature2) {
       for (const s of signatures2) {
-        if (!sigPoolMap.has(s.signature)) sigPoolMap.set(s.signature, pool2);
+        if (!sigPoolMap.has(s.signature) && !processedTradesSet.has(s.signature)) {
+          sigPoolMap.set(s.signature, pool2);
+        }
+      }
+      for (const s of safetyNet2) {
+        if (!sigPoolMap.has(s.signature) && !processedTradesSet.has(s.signature)) {
+          sigPoolMap.set(s.signature, pool2);
+        }
       }
     }
 
     const allSigList = [...sigPoolMap.keys()];
-    console.log('[CM] Processing', allSigList.length, 'signatures (pool1:', signatures1.length, 'pool2:', signatures2.length, ')');
+    console.log('[CM] Processing', allSigList.length, 'signatures (new:', signatures1.length + signatures2.length, 'safety:', safetyNet1.length + safetyNet2.length, ')');
 
     // Step 3: Fetch parsed transactions from Helius
     const parsedTxs = await fetchParsedTransactions(allSigList);
@@ -199,6 +289,7 @@ export async function POST(request: Request) {
       if (!tx) continue;
       if (tx.transactionError) continue;
       if (ownSigSet.has(tx.signature)) continue;
+      if (processedTradesSet.has(tx.signature)) continue;
 
       const feePayer = tx.feePayer || '';
       if (ownWalletSet.has(feePayer)) continue;
@@ -285,49 +376,96 @@ export async function POST(request: Request) {
           continue;
         }
 
-        const eligible = sellWallets.filter((w: WalletEntry) => w.tokenBalance >= trade.tokenAmount);
+        const minSellable = 1 / 10 ** (tokenDecimals || 6);
+        const eligible = sellWallets
+          .filter((w: WalletEntry) => w.tokenBalance > minSellable)
+          .sort((a: WalletEntry, b: WalletEntry) => b.tokenBalance - a.tokenBalance);
+
         if (eligible.length === 0) {
           events.push({
             id: `skip-${eventId}`, timestamp: new Date().toISOString(), type: 'skip',
             tokenAmount: trade.tokenAmount, dollarAmount: trade.dollarAmount, signature: trade.signature,
-            message: `No wallets with enough tokens (need ≥${Math.ceil(trade.tokenAmount).toLocaleString()} tokens)`,
+            message: 'No wallets with tokens available for counter-sell',
           });
           continue;
         }
 
-        const wallet = eligible[Math.floor(Math.random() * eligible.length)];
-        const sellAmount = Math.min(trade.tokenAmount, wallet.tokenBalance);
+        let remaining = trade.tokenAmount;
 
-        try {
-          const result = await executeSell(connection, trade.pool, tokenMint, wallet, sellAmount, slippageBps || 100, tokenDecimals || 6);
+        for (const wallet of eligible) {
+          if (remaining <= minSellable) break;
 
-          if (result.signature) {
-            wallet.tokenBalance -= result.amountSold;
+          const sellAmount = Math.min(remaining, wallet.tokenBalance);
+          if (sellAmount <= minSellable) continue;
+
+          try {
+            const result = await executeSell(connection, trade.pool, tokenMint, wallet, sellAmount, 10000, tokenDecimals || 6);
+
+            if (result.signature) {
+              remaining -= result.amountSold;
+              wallet.tokenBalance -= result.amountSold;
+              events.push({
+                id: `sell-${eventId}-${wallet.publicKey.slice(0, 6)}`, timestamp: new Date().toISOString(), type: 'counter-sell',
+                tokenAmount: result.amountSold, dollarAmount: result.quoteReceived || 0,
+                signature: trade.signature, counterSignature: result.signature,
+                wallet: wallet.publicKey.slice(0, 8),
+                message: `${poolLabel} Counter-sold ${result.amountSold.toLocaleString()} tokens via ${wallet.label || wallet.publicKey.slice(0, 8)}`,
+              });
+
+              const solReceived = result.quoteReceived || 0;
+              if (trade.pool.quoteIsSOL && solReceived > 0) {
+                try {
+                  console.log(`[CM] Waiting for sell tx confirmation before swap: ${result.signature}`);
+                  await connection.confirmTransaction(result.signature, 'confirmed');
+                  console.log(`[CM] Sell confirmed, swapping ${solReceived.toFixed(4)} SOL → USDC`);
+                  const swapResult = await jupiterSwapSolToUsdc(wallet, solReceived);
+                  if (swapResult.signature) {
+                    events.push({
+                      id: `swap-${eventId}-${wallet.publicKey.slice(0, 6)}`, timestamp: new Date().toISOString(), type: 'counter-sell',
+                      tokenAmount: 0, dollarAmount: swapResult.usdcReceived,
+                      signature: result.signature, counterSignature: swapResult.signature,
+                      wallet: wallet.publicKey.slice(0, 8),
+                      message: `[SOL→USDC] Auto-swapped ${solReceived.toFixed(4)} SOL → ${swapResult.usdcReceived.toFixed(2)} USDC via ${wallet.label || wallet.publicKey.slice(0, 8)}`,
+                    });
+                  }
+                } catch (swapErr) {
+                  const swapErrMsg = (swapErr as Error).message;
+                  console.error('[CM] Auto-swap SOL→USDC failed:', swapErrMsg);
+                  events.push({
+                    id: `swap-err-${eventId}-${wallet.publicKey.slice(0, 6)}`, timestamp: new Date().toISOString(), type: 'error',
+                    tokenAmount: 0, dollarAmount: solReceived,
+                    signature: result.signature,
+                    message: `[SOL→USDC] Auto-swap failed: ${swapErrMsg.slice(0, 100)}`,
+                  });
+                }
+              }
+            } else {
+              events.push({
+                id: `err-${eventId}-${wallet.publicKey.slice(0, 6)}`, timestamp: new Date().toISOString(), type: 'error',
+                tokenAmount: sellAmount, dollarAmount: trade.dollarAmount, signature: trade.signature,
+                message: `${poolLabel} Counter-sell failed on ${wallet.label || wallet.publicKey.slice(0, 8)}: ${result.error}`,
+              });
+            }
+          } catch (err) {
             events.push({
-              id: `sell-${eventId}`, timestamp: new Date().toISOString(), type: 'counter-sell',
-              tokenAmount: result.amountSold, dollarAmount: result.quoteReceived || 0,
-              signature: trade.signature, counterSignature: result.signature,
-              wallet: wallet.publicKey.slice(0, 8),
-              message: `${poolLabel} Counter-sold ${result.amountSold.toLocaleString()} tokens via ${wallet.label || wallet.publicKey.slice(0, 8)}`,
-            });
-          } else {
-            events.push({
-              id: `err-${eventId}`, timestamp: new Date().toISOString(), type: 'error',
-              tokenAmount: trade.tokenAmount, dollarAmount: trade.dollarAmount, signature: trade.signature,
-              message: `${poolLabel} Counter-sell failed: ${result.error}`,
+              id: `err-${eventId}-${wallet.publicKey.slice(0, 6)}`, timestamp: new Date().toISOString(), type: 'error',
+              tokenAmount: sellAmount, dollarAmount: trade.dollarAmount, signature: trade.signature,
+              message: `${poolLabel} Counter-sell error on ${wallet.label || wallet.publicKey.slice(0, 8)}: ${(err as Error).message}`,
             });
           }
-        } catch (err) {
+        }
+
+        if (remaining > 0.01) {
           events.push({
-            id: `err-${eventId}`, timestamp: new Date().toISOString(), type: 'error',
-            tokenAmount: trade.tokenAmount, dollarAmount: trade.dollarAmount, signature: trade.signature,
-            message: `${poolLabel} Counter-sell error: ${(err as Error).message}`,
+            id: `warn-${eventId}`, timestamp: new Date().toISOString(), type: 'skip',
+            tokenAmount: remaining, dollarAmount: 0, signature: trade.signature,
+            message: `${poolLabel} Insufficient tokens across all wallets — ${remaining.toLocaleString()} tokens not covered`,
           });
         }
       }
 
-      // Counter-buy on external sell (pool1 only)
-      if (trade.type === 'external-sell' && trade.pool !== pool2 && (mode === 'buy-on-sell' || mode === 'both')) {
+      // Counter-buy on external sell (both pools)
+      if (trade.type === 'external-sell' && (mode === 'buy-on-sell' || mode === 'both')) {
         const buyWallets = (body.buyWallets || []) as WalletEntry[];
         const eligible = trade.pool.quoteIsSOL
           ? buyWallets.filter((w: WalletEntry) => (w.solBalance || 0) > 0.01).sort((a: WalletEntry, b: WalletEntry) => (b.solBalance || 0) - (a.solBalance || 0))
@@ -360,7 +498,7 @@ export async function POST(request: Request) {
           if (spendAmount < 0.001) continue;
 
           try {
-            const result = await executeBuy(connection, trade.pool, tokenMint, wallet, spendAmount, slippageBps || 100, tokenDecimals || 6);
+            const result = await executeBuy(connection, trade.pool, tokenMint, wallet, spendAmount, 10000, tokenDecimals || 6);
 
             if (result.signature) {
               remaining -= result.quoteSpent;
@@ -404,11 +542,15 @@ export async function POST(request: Request) {
 
     // Bonus micro-buy after each successful counter-trade (on both pools)
     const allBuyWallets = (body.buyWallets || []) as WalletEntry[];
-    const counterEvents = events.filter(e => (e.type === 'counter-sell' || e.type === 'counter-buy') && e.counterSignature);
+    const counterEvents = events.filter(e =>
+      (e.type === 'counter-sell' || e.type === 'counter-buy')
+      && e.counterSignature
+      && !e.message?.startsWith('[SOL→USDC]')
+    );
 
     for (const ce of counterEvents) {
       const microDollar = 1 + Math.random() * 2; // $1-$3
-      const isPool2Event = ce.message?.startsWith('[SOL]');
+      const isPool2Event = ce.message?.includes('[SOL]');
       const microPool = (isPool2Event && pool2) ? pool2 : pool1;
       const microIsSOL = microPool.quoteIsSOL;
       const microAmount = microIsSOL ? microDollar / solPrice : microDollar;
@@ -429,7 +571,7 @@ export async function POST(request: Request) {
       const poolLabel = microPool === pool2 ? '[SOL]' : '[USDC]';
 
       try {
-        const result = await executeBuy(connection, microPool, tokenMint, microWallet, microAmount, slippageBps || 100, tokenDecimals || 6);
+        const result = await executeBuy(connection, microPool, tokenMint, microWallet, microAmount, 10000, tokenDecimals || 6);
 
         if (result.signature) {
           if (microIsSOL) {
