@@ -105,6 +105,7 @@ export default function SellStrategy({
   // Quick Trade state
   const [quickTradeMode, setQuickTradeMode] = useState(true);
   const [quickTradeSlippage, setQuickTradeSlippage] = useState(30);
+  const [quickTradePool, setQuickTradePool] = useState<'pool1' | 'pool2'>('pool1');
   const [customQuickSellPct, setCustomQuickSellPct] = useState<Record<string, string>>({});
   const [customQuickSellAmt, setCustomQuickSellAmt] = useState<Record<string, string>>({});
   const [customBuyAmount, setCustomBuyAmount] = useState<Record<string, string>>({});
@@ -194,7 +195,7 @@ export default function SellStrategy({
   const [cmEnabled, setCmEnabled] = useState(false);
   const [cmSellOnBuy, setCmSellOnBuy] = useState(true);
   const [cmBuyOnSell, setCmBuyOnSell] = useState(false);
-  const [cmMinDollar, setCmMinDollar] = useState(40);
+  const [cmMinDollar, setCmMinDollar] = useState(5);
   const [cmSlippage, setCmSlippage] = useState(5000); // bps
   const [cmPollMs, setCmPollMs] = useState(3000);
   const [cmLog, setCmLog] = useState<Array<{
@@ -208,14 +209,24 @@ export default function SellStrategy({
     message: string;
     timestamp: string;
   }>>([]);
+  const [cmPool2, setCmPool2] = useState(() => {
+    if (typeof window !== 'undefined') return localStorage.getItem('cmPool2') || '';
+    return '';
+  });
   const cmActiveRef = useRef(false);
   const cmLastSigRef = useRef<string | null>(null);
+  const cmLastSig2Ref = useRef<string | null>(null);
   const cmIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const cmProcessingRef = useRef(false);
   const cmOwnSignaturesRef = useRef<Set<string>>(new Set());
+  const cmProcessedTradesRef = useRef<Set<string>>(new Set());
+  const cmPendingSignaturesRef = useRef<Set<string>>(new Set());
+  const cmAccumDollarRef = useRef(0);
+  const cmAccumTokensRef = useRef(0);
   const wsRef = useRef<WebSocket | null>(null);
   const wsConnectedRef = useRef(false);
   const balanceFallbackRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const wsSubMapRef = useRef<Record<number, 'wallets' | 'pool1' | 'pool2'>>({});
 
   const csvInputRef = useRef<HTMLInputElement>(null);
 
@@ -614,6 +625,7 @@ export default function SellStrategy({
     }
 
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let pingTimer: ReturnType<typeof setInterval> | null = null;
     let alive = true;
 
     // Initial fetch
@@ -638,34 +650,59 @@ export default function SellStrategy({
 
         ws.onopen = () => {
           wsConnectedRef.current = true;
+          wsSubMapRef.current = {};
           stopFallback();
           // Sub 1: wallet transactions (balance refresh trigger)
           ws.send(JSON.stringify({
             jsonrpc: '2.0', id: 1, method: 'transactionSubscribe',
-            params: [{ accountInclude: pubkeys }, { commitment: 'confirmed', transactionDetails: 'none' }],
+            params: [{ accountInclude: pubkeys, vote: false, failed: false }, { commitment: 'confirmed', transactionDetails: 'none' }],
           }));
-          // Sub 2: pool logs (Chart Manager trigger) — only if pool is set
+          // Sub 2: pool1 transactions (Chart Manager trigger) — enhanced WS
           if (poolAddressInput?.trim()) {
             ws.send(JSON.stringify({
-              jsonrpc: '2.0', id: 2, method: 'logsSubscribe',
-              params: [{ mentions: [poolAddressInput.trim()] }, { commitment: 'confirmed' }],
+              jsonrpc: '2.0', id: 2, method: 'transactionSubscribe',
+              params: [{ accountInclude: [poolAddressInput.trim()], vote: false, failed: false }, { commitment: 'confirmed', transactionDetails: 'signatures', maxSupportedTransactionVersion: 0 }],
             }));
           }
-          console.log('[WS] Connected — subscribed to', pubkeys.length, 'wallets' + (poolAddressInput ? ' + pool' : ''));
+          // Sub 3: pool2 transactions (DLMM/SOL pool) — enhanced WS
+          if (cmPool2?.trim()) {
+            ws.send(JSON.stringify({
+              jsonrpc: '2.0', id: 3, method: 'transactionSubscribe',
+              params: [{ accountInclude: [cmPool2.trim()], vote: false, failed: false }, { commitment: 'confirmed', transactionDetails: 'signatures', maxSupportedTransactionVersion: 0 }],
+            }));
+          }
+          console.log('[WS] Connected (transactionSubscribe) — subscribed to', pubkeys.length, 'wallets' + (poolAddressInput ? ' + pool1' : '') + (cmPool2 ? ' + pool2' : ''));
+          // Ping every 30s to keep connection alive (Helius requirement)
+          if (pingTimer) clearInterval(pingTimer);
+          pingTimer = setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ jsonrpc: '2.0', id: 0, method: 'ping' }));
+            }
+          }, 30000);
         };
 
         ws.onmessage = (event) => {
           try {
             const msg = JSON.parse(event.data);
+            // Map subscription IDs from confirmation responses (skip ping responses id=0)
+            if (msg.id && msg.id !== 0 && msg.result !== undefined) {
+              const idToRole: Record<number, 'wallets' | 'pool1' | 'pool2'> = { 1: 'wallets', 2: 'pool1', 3: 'pool2' };
+              if (idToRole[msg.id]) wsSubMapRef.current[msg.result] = idToRole[msg.id];
+              return;
+            }
             if (msg.method === 'transactionNotification') {
-              handleRefreshBalances();
-              refreshCreatorBal();
-            } else if (msg.method === 'logsNotification' && msg.params?.result?.value) {
-              if (!msg.params.result.value.err) {
-                // Pool activity — Chart Manager will pick it up via its own polling trigger
-                if (cmActiveRef.current) {
-                  const cmEvent = new CustomEvent('cm-pool-activity');
-                  window.dispatchEvent(cmEvent);
+              const subId = msg.params?.subscription;
+              const role = wsSubMapRef.current[subId];
+              const sig = msg.params?.result?.signature;
+              if (role === 'wallets') {
+                handleRefreshBalances();
+                refreshCreatorBal();
+              } else if (role === 'pool1' || role === 'pool2') {
+                if (sig && !cmPendingSignaturesRef.current.has(sig)) {
+                  cmPendingSignaturesRef.current.add(sig);
+                  if (cmActiveRef.current) {
+                    window.dispatchEvent(new CustomEvent('cm-pool-activity'));
+                  }
                 }
               }
             }
@@ -675,10 +712,11 @@ export default function SellStrategy({
         ws.onclose = () => {
           wsConnectedRef.current = false;
           wsRef.current = null;
+          if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
           if (alive) {
             console.log('[WS] Closed — fallback polling');
             startFallback();
-            reconnectTimer = setTimeout(connect, 5000);
+            reconnectTimer = setTimeout(connect, 2000);
           }
         };
 
@@ -696,11 +734,12 @@ export default function SellStrategy({
     return () => {
       alive = false;
       stopFallback();
+      if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
       if (wsRef.current) { wsRef.current.close(); wsRef.current = null; }
       wsConnectedRef.current = false;
       if (reconnectTimer) clearTimeout(reconnectTimer);
     };
-  }, [wallets.length > 0, tokenMintInput, network, poolAddressInput]);
+  }, [wallets.length > 0, tokenMintInput, network, poolAddressInput, cmPool2]);
 
   useEffect(() => {
     if (!creatorKey) return;
@@ -1171,18 +1210,31 @@ export default function SellStrategy({
     if (!poolAddressInput || !tokenMintInput) return;
 
     cmActiveRef.current = true;
+    cmAccumDollarRef.current = 0;
+    cmAccumTokensRef.current = 0;
     const cmMode = cmSellOnBuy && cmBuyOnSell ? 'both' : cmSellOnBuy ? 'sell-on-buy' : 'buy-on-sell';
 
+    const cmPendingPollRef = { current: false };
+
     const pollChartManager = async () => {
-      if (!cmActiveRef.current || cmProcessingRef.current) return;
+      if (!cmActiveRef.current) return;
+      if (cmProcessingRef.current) {
+        cmPendingPollRef.current = true;
+        return;
+      }
       cmProcessingRef.current = true;
+      cmPendingSignaturesRef.current.clear();
 
       try {
         const currentWallets = walletsRef.current;
         const ownPubkeys = currentWallets.map(w => w.publicKey);
         if (creatorKey) ownPubkeys.push(creatorKey);
 
-        const sellWalletsData = currentWallets
+        const nonDevWallets = creatorKey
+          ? currentWallets.filter(w => w.privateKey !== creatorKey)
+          : currentWallets;
+
+        const sellWalletsData = nonDevWallets
           .filter(w => w.tokenBalance > 0)
           .map(w => ({
             id: w.id, publicKey: w.publicKey, privateKey: w.privateKey,
@@ -1190,8 +1242,8 @@ export default function SellStrategy({
             usdcBalance: w.usdcBalance, label: w.label, createdAt: w.createdAt,
           }));
 
-        const buyWalletsData = currentWallets
-          .filter(w => w.usdcBalance >= cmMinDollar)
+        const buyWalletsData = nonDevWallets
+          .filter(w => w.usdcBalance >= cmMinDollar || w.solBalance > 0.01)
           .sort((a, b) => b.usdcBalance - a.usdcBalance)
           .map(w => ({
             id: w.id, publicKey: w.publicKey, privateKey: w.privateKey,
@@ -1204,10 +1256,13 @@ export default function SellStrategy({
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             poolAddress: poolAddressInput.trim(),
+            poolAddress2: cmPool2?.trim() || undefined,
             tokenMint: tokenMintInput.trim(),
             ownWallets: ownPubkeys,
             ownSignatures: [...cmOwnSignaturesRef.current],
+            processedTrades: [...cmProcessedTradesRef.current],
             lastSignature: cmLastSigRef.current,
+            lastSignature2: cmLastSig2Ref.current,
             minDollar: cmMinDollar,
             mode: cmMode,
             sellWallets: sellWalletsData,
@@ -1215,6 +1270,9 @@ export default function SellStrategy({
             slippageBps: cmSlippage,
             tokenDecimals,
             network,
+            accumulatedBuyDollars: cmAccumDollarRef.current,
+            accumulatedBuyTokens: cmAccumTokensRef.current,
+            accumThreshold: 25,
           }),
         });
 
@@ -1223,10 +1281,32 @@ export default function SellStrategy({
           if (data.data.lastSignature) {
             cmLastSigRef.current = data.data.lastSignature;
           }
+          if (data.data.lastSignature2) {
+            cmLastSig2Ref.current = data.data.lastSignature2;
+          }
           if (data.data.events && data.data.events.length > 0) {
             setCmLog(prev => [...data.data.events, ...prev].slice(0, 200));
             for (const evt of data.data.events) {
               if (evt.counterSignature) cmOwnSignaturesRef.current.add(evt.counterSignature);
+              if (evt.signature && (evt.type === 'external-buy' || evt.type === 'external-sell' || evt.type === 'counter-sell' || evt.type === 'counter-buy')) {
+                cmProcessedTradesRef.current.add(evt.signature);
+                if (cmProcessedTradesRef.current.size > 500) {
+                  const arr = [...cmProcessedTradesRef.current];
+                  cmProcessedTradesRef.current = new Set(arr.slice(-500));
+                }
+              }
+              if (evt.type === 'sub-threshold') {
+                cmAccumDollarRef.current += evt.dollarAmount;
+                cmAccumTokensRef.current += evt.tokenAmount;
+              }
+              if (evt.type === 'counter-buy' && evt.message?.includes('Micro-buy')) {
+                cmAccumDollarRef.current += evt.dollarAmount;
+                cmAccumTokensRef.current += evt.tokenAmount;
+              }
+              if (evt.type === 'accum-reset') {
+                cmAccumDollarRef.current = 0;
+                cmAccumTokensRef.current = 0;
+              }
               if (evt.type === 'counter-sell') addToast(`Chart Manager: sold ${evt.tokenAmount.toLocaleString()} tokens`, 'success');
               else if (evt.type === 'counter-buy') addToast(`Chart Manager: bought ${evt.tokenAmount.toLocaleString()} tokens`, 'success');
               else if (evt.type === 'error') addToast(`Chart Manager: ${evt.message}`, 'error');
@@ -1237,6 +1317,10 @@ export default function SellStrategy({
         // Skip failed poll
       } finally {
         cmProcessingRef.current = false;
+        if (cmPendingPollRef.current || cmPendingSignaturesRef.current.size > 0) {
+          cmPendingPollRef.current = false;
+          setTimeout(() => pollChartManager(), 500);
+        }
       }
     };
 
@@ -1247,21 +1331,20 @@ export default function SellStrategy({
     // Initial poll to set baseline
     pollChartManager();
 
-    // Fallback polling if WebSocket not connected
-    if (!wsConnectedRef.current) {
-      cmIntervalRef.current = setInterval(pollChartManager, cmPollMs);
-    }
+    // Fallback polling — also runs as safety net when WS is connected (slower)
+    cmIntervalRef.current = setInterval(pollChartManager, wsConnectedRef.current ? 5000 : cmPollMs);
 
     return () => {
       cmActiveRef.current = false;
       window.removeEventListener('cm-pool-activity', onPoolActivity);
       if (cmIntervalRef.current) { clearInterval(cmIntervalRef.current); cmIntervalRef.current = null; }
     };
-  }, [cmEnabled, cmSellOnBuy, cmBuyOnSell, cmMinDollar, cmSlippage, cmPollMs, poolAddressInput, tokenMintInput, network, tokenDecimals, addToast, creatorKey]);
+  }, [cmEnabled, cmSellOnBuy, cmBuyOnSell, cmMinDollar, cmSlippage, cmPollMs, poolAddressInput, tokenMintInput, network, tokenDecimals, addToast, creatorKey, cmPool2]);
 
   // Quick sell for a single wallet
   const handleQuickSell = useCallback(async (wallet: WalletEntry, pct: number) => {
-    if (!poolAddressInput || !tokenMintInput) {
+    const activePool = quickTradePool === 'pool2' && cmPool2?.trim() ? cmPool2.trim() : poolAddressInput;
+    if (!activePool || !tokenMintInput) {
       addToast('Pool address and token mint are required', 'error');
       return;
     }
@@ -1273,7 +1356,7 @@ export default function SellStrategy({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          poolAddress: poolAddressInput.trim(),
+          poolAddress: activePool.trim(),
           tokenMint: tokenMintInput.trim(),
           wallets: [wallet],
           percentage: pct,
@@ -1316,23 +1399,33 @@ export default function SellStrategy({
         return next;
       });
     }
-  }, [poolAddressInput, tokenMintInput, quickTradeSlippage, tokenDecimals, network, addToast, onAddLog, fetchPriceCache]);
+  }, [poolAddressInput, tokenMintInput, quickTradeSlippage, tokenDecimals, network, addToast, onAddLog, fetchPriceCache, quickTradePool, cmPool2]);
 
   // Quick buy for a single wallet
-  const handleQuickBuy = useCallback(async (wallet: WalletEntry, quoteAmount: number) => {
-    if (!poolAddressInput || !tokenMintInput) {
+  const handleQuickBuy = useCallback(async (wallet: WalletEntry, dollarAmount: number) => {
+    const isPool2 = quickTradePool === 'pool2' && cmPool2?.trim();
+    const activePool = isPool2 ? cmPool2.trim() : poolAddressInput;
+    if (!activePool || !tokenMintInput) {
       addToast('Pool address and token mint are required', 'error');
       return;
     }
-    const actionKey = `buy-${quoteAmount}`;
+    const actionKey = `buy-${dollarAmount}`;
     setWalletActionLoading((prev) => new Map(prev).set(wallet.id, actionKey));
 
     try {
+      let quoteAmount = dollarAmount;
+      if (isPool2) {
+        const priceRes = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+        const priceData = await priceRes.json();
+        const solPrice = priceData?.solana?.usd || 84;
+        quoteAmount = dollarAmount / solPrice;
+      }
+
       const res = await fetch('/api/wallets/buy', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          poolAddress: poolAddressInput.trim(),
+          poolAddress: activePool.trim(),
           tokenMint: tokenMintInput.trim(),
           wallet,
           quoteAmount,
@@ -1350,7 +1443,7 @@ export default function SellStrategy({
 
       const label = wallet.label || truncateKey(wallet.publicKey);
       addToast(
-        `${label}: Bought ${r?.tokensReceived?.toLocaleString() || '?'} tokens for ${quoteAmount} ${r?.quoteSymbol || 'SOL'}`,
+        `${label}: Bought ${r?.tokensReceived?.toLocaleString() || '?'} tokens for $${dollarAmount}`,
         'success'
       );
 
@@ -1359,7 +1452,7 @@ export default function SellStrategy({
         type: 'buy',
         signature: r?.signature || 'N/A',
         status: 'success',
-        message: `Quick buy ${quoteAmount} ${r?.quoteSymbol || 'SOL'} worth from ${label}`,
+        message: `Quick buy $${dollarAmount} worth from ${label}`,
         timestamp: new Date().toISOString(),
       });
 
@@ -1374,7 +1467,43 @@ export default function SellStrategy({
         return next;
       });
     }
-  }, [poolAddressInput, tokenMintInput, quickTradeSlippage, tokenDecimals, network, addToast, onAddLog, fetchPriceCache]);
+  }, [poolAddressInput, tokenMintInput, quickTradeSlippage, tokenDecimals, network, addToast, onAddLog, fetchPriceCache, quickTradePool, cmPool2]);
+
+  const handleSwap = useCallback(async (wallet: WalletEntry, direction: 'usdc-to-sol' | 'sol-to-usdc', fixedAmount?: number) => {
+    const actionKey = `swap-${direction}`;
+    setWalletActionLoading((prev) => new Map(prev).set(wallet.id, actionKey));
+
+    try {
+      const amount = fixedAmount ?? (direction === 'usdc-to-sol'
+        ? wallet.usdcBalance || 0
+        : (wallet.solBalance || 0) - 0.05);
+
+      if (amount <= 0) {
+        addToast(`No ${direction === 'usdc-to-sol' ? 'USDC' : 'SOL'} to swap`, 'error');
+        return;
+      }
+
+      const res = await fetch('/api/wallets/swap', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ wallet, direction, amount }),
+      });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error);
+
+      const label = wallet.label || truncateKey(wallet.publicKey);
+      addToast(`${label}: Swapped ${amount.toFixed(4)} ${direction === 'usdc-to-sol' ? 'USDC' : 'SOL'} → ${data.data.received.toFixed(4)} ${data.data.symbol}`, 'success');
+      fetchPriceCache();
+    } catch (err) {
+      addToast(`Swap failed: ${(err as Error).message.slice(0, 80)}`, 'error');
+    } finally {
+      setWalletActionLoading((prev) => {
+        const next = new Map(prev);
+        next.delete(wallet.id);
+        return next;
+      });
+    }
+  }, [addToast, fetchPriceCache]);
 
   const handleExecuteSell = async () => {
     if (selectedWallets.length === 0) {
@@ -1479,9 +1608,10 @@ export default function SellStrategy({
     }
   };
 
+  const poolIsSol = quickTradePool === 'pool2' && cmPool2?.trim() ? true : priceQuoteSymbol === 'SOL';
   const isSolPaired = priceQuoteSymbol === 'SOL';
-  const quickSellPresets = [0.15, 0.2, 0.3, 0.5, 1, 2.5, 5, 10];
-  const quickBuyPresets = isSolPaired ? [0.5, 1, 2] : [50, 100, 200, 400, 500, 600];
+  const quickSellPresets = [0.15, 0.2, 0.3, 0.5, 1, 2.5, 5, 10, 20, 30, 40, 50];
+  const quickBuyPresets = [50, 100, 200, 400, 500, 600, 1000, 2000, 5000, 10000, 15000];
 
   const isWalletBusy = (walletId: string) => walletActionLoading.has(walletId);
   const getWalletAction = (walletId: string) => walletActionLoading.get(walletId) || '';
@@ -1582,6 +1712,7 @@ export default function SellStrategy({
                   </span>
                 </div>
               </div>
+{}
             </div>
           </div>
 
@@ -1833,6 +1964,20 @@ export default function SellStrategy({
                 <TrendingUp className="w-4 h-4" />
                 Buy on Sell
               </button>
+            </div>
+
+            {/* Pool 2 (DLMM/SOL) */}
+            <div>
+              <label className="block text-[10px] text-[#71717a] uppercase tracking-wider font-medium mb-1">
+                Pool 2 (DLMM / SOL) — optional
+              </label>
+              <input
+                type="text"
+                value={cmPool2}
+                onChange={(e) => { setCmPool2(e.target.value); localStorage.setItem('cmPool2', e.target.value); }}
+                placeholder="DLMM pool address..."
+                className="w-full bg-[#09090b] border border-[#27272a] rounded-lg px-3 py-2 text-white text-sm focus:ring-1 focus:ring-cyan-500/50 focus:border-cyan-500 outline-none font-mono placeholder:text-[#3f3f46]"
+              />
             </div>
 
             {/* Settings */}
@@ -2630,7 +2775,7 @@ export default function SellStrategy({
                           {truncateKey(wallet.publicKey)}
                         </span>
                       </div>
-                      <div className="flex items-center gap-4 text-xs">
+                      <div className="flex items-center gap-3 text-xs">
                         <div className="text-right">
                           <span className="font-mono text-white">
                             {wallet.tokenBalance.toLocaleString()}
@@ -2649,6 +2794,58 @@ export default function SellStrategy({
                           </span>
                           <span className="text-[#52525b] ml-1">USDC</span>
                         </div>
+                        <button
+                          onClick={() => handleSwap(wallet, 'usdc-to-sol', 10)}
+                          disabled={busy || (wallet.usdcBalance || 0) < 10}
+                          title="Swap 10 USDC → SOL"
+                          className="px-2 py-1 rounded-md text-[10px] font-semibold transition-all border bg-[#09090b] text-green-400 border-green-500/30 hover:border-green-500 hover:bg-green-500/10 disabled:opacity-30 disabled:cursor-not-allowed"
+                        >
+                          {busy && activeAction === 'swap-usdc-to-sol' ? (
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                          ) : (
+                            '10$ → SOL'
+                          )}
+                        </button>
+                        <button
+                          onClick={() => handleSwap(wallet, 'usdc-to-sol')}
+                          disabled={busy || (wallet.usdcBalance || 0) < 0.01}
+                          title="Swap all USDC → SOL"
+                          className="px-2 py-1 rounded-md text-[10px] font-semibold transition-all border bg-[#09090b] text-yellow-400 border-yellow-500/30 hover:border-yellow-500 hover:bg-yellow-500/10 disabled:opacity-30 disabled:cursor-not-allowed"
+                        >
+                          {busy && activeAction === 'swap-usdc-to-sol' ? (
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                          ) : (
+                            '→ SOL'
+                          )}
+                        </button>
+                        <button
+                          onClick={() => handleSwap(wallet, 'sol-to-usdc')}
+                          disabled={busy || (wallet.solBalance || 0) < 0.02}
+                          title="Swap all SOL → USDC (keeps 0.05 SOL)"
+                          className="px-2 py-1 rounded-md text-[10px] font-semibold transition-all border bg-[#09090b] text-blue-400 border-blue-500/30 hover:border-blue-500 hover:bg-blue-500/10 disabled:opacity-30 disabled:cursor-not-allowed"
+                        >
+                          {busy && activeAction === 'swap-sol-to-usdc' ? (
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                          ) : (
+                            '→ USDC'
+                          )}
+                        </button>
+                        <input
+                          type="number"
+                          step="0.01"
+                          min="0.01"
+                          placeholder="SOL"
+                          className="w-14 px-1.5 py-1 rounded-md text-[10px] bg-[#09090b] border border-[#27272a] text-white text-center focus:border-blue-500 focus:outline-none"
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              const val = parseFloat((e.target as HTMLInputElement).value);
+                              if (val > 0) {
+                                handleSwap(wallet, 'sol-to-usdc', val);
+                                (e.target as HTMLInputElement).value = '';
+                              }
+                            }
+                          }}
+                        />
                       </div>
                     </div>
 
@@ -2725,7 +2922,7 @@ export default function SellStrategy({
                                 const val = parseFloat(customQuickSellPct[wallet.id] || '');
                                 if (!isNaN(val) && val > 0 && pricePerToken > 0) {
                                   const est = wallet.tokenBalance * (val / 100) * pricePerToken;
-                                  if (isSolPaired) return est < 0.01 ? `${est.toFixed(4)} SOL` : `${est.toFixed(3)} SOL`;
+                                  if (poolIsSol) return est < 0.01 ? `${est.toFixed(4)} SOL` : `${est.toFixed(3)} SOL`;
                                   return est < 0.01 ? `$${est.toFixed(4)}` : `$${est.toFixed(2)}`;
                                 }
                                 return 'Go';
@@ -2795,8 +2992,6 @@ export default function SellStrategy({
                             >
                               {isActive ? (
                                 <Loader2 className="w-3 h-3 animate-spin inline" />
-                              ) : isSolPaired ? (
-                                `${amount} SOL`
                               ) : (
                                 `$${amount}`
                               )}
@@ -2814,7 +3009,7 @@ export default function SellStrategy({
                                 [wallet.id]: e.target.value,
                               }))
                             }
-                            placeholder={isSolPaired ? 'SOL' : '$'}
+                            placeholder="$"
                             min={0.001}
                             step={0.1}
                             disabled={busy}
@@ -3349,6 +3544,53 @@ export default function SellStrategy({
           )}
         </div>
       </div>
+
+      <div className="fixed bottom-6 left-6 z-50 bg-[#18181b] border border-[#27272a] rounded-xl px-4 py-3 shadow-2xl shadow-black/50">
+        <div className="flex items-center gap-4 text-xs">
+          <div className="text-right">
+            <span className="font-mono text-[#a1a1aa]">
+              {(allWallets.reduce((s, w) => s + (w.solBalance ?? 0), 0) + creatorSolBal).toFixed(4)}
+            </span>
+            <span className="text-[#52525b] ml-1">SOL</span>
+          </div>
+          <div className="text-right">
+            <span className="font-mono text-blue-400">
+              {(allWallets.reduce((s, w) => s + (w.usdcBalance ?? 0), 0) + creatorUsdcBal).toFixed(2)}
+            </span>
+            <span className="text-[#52525b] ml-1">USDC</span>
+          </div>
+          <div className="text-right">
+            <span className="font-mono text-white">
+              {allWallets.reduce((s, w) => s + w.tokenBalance, 0).toLocaleString()}
+            </span>
+            <span className="text-[#52525b] ml-1">tokens</span>
+          </div>
+        </div>
+      </div>
+
+      {cmPool2?.trim() && (
+        <div className="fixed bottom-6 right-6 z-[10000] flex items-center gap-2 bg-[#18181b] border border-[#27272a] rounded-xl px-4 py-3 shadow-2xl shadow-black/50">
+          <label className="text-xs text-[#a1a1aa] font-medium">Pool</label>
+          <div className="flex bg-[#09090b] border border-[#27272a] rounded-lg overflow-hidden">
+            <button
+              onClick={() => setQuickTradePool('pool1')}
+              className={`px-4 py-2 text-sm font-semibold transition-colors ${
+                quickTradePool === 'pool1' ? 'bg-purple-600 text-white' : 'text-[#71717a] hover:text-white'
+              }`}
+            >
+              USDC
+            </button>
+            <button
+              onClick={() => setQuickTradePool('pool2')}
+              className={`px-4 py-2 text-sm font-semibold transition-colors ${
+                quickTradePool === 'pool2' ? 'bg-cyan-600 text-white' : 'text-[#71717a] hover:text-white'
+              }`}
+            >
+              SOL
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -1,10 +1,11 @@
 import { Connection, PublicKey } from '@solana/web3.js';
 
-export type PoolType = 'meteora-cpamm' | 'raydium-amm-v4' | 'raydium-clmm' | 'raydium-cpmm';
+export type PoolType = 'meteora-cpamm' | 'meteora-dlmm' | 'raydium-amm-v4' | 'raydium-clmm' | 'raydium-cpmm';
 
 const RAYDIUM_AMM_V4_PROGRAM = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
 const RAYDIUM_CLMM_PROGRAM = 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK';
 const RAYDIUM_CPMM_PROGRAM = 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C';
+const METEORA_DLMM_PROGRAM = 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo';
 
 export interface PoolInfo {
   type: PoolType;
@@ -62,6 +63,16 @@ export async function getPoolInfo(connection: Connection, poolAddress: string): 
     if (!result.tokenAVault || !result.tokenBVault) {
       throw new Error('Could not parse CLMM vault addresses');
     }
+  } else if (owner === METEORA_DLMM_PROGRAM) {
+    const DLMM = (await import('@meteora-ag/dlmm')).default;
+    const dlmmPool = await DLMM.create(connection as any, pubkey);
+    result = {
+      type: 'meteora-dlmm',
+      tokenAVault: dlmmPool.tokenX.reserve.toBase58(),
+      tokenBVault: dlmmPool.tokenY.reserve.toBase58(),
+      tokenAMint: dlmmPool.lbPair.tokenXMint.toBase58(),
+      tokenBMint: dlmmPool.lbPair.tokenYMint.toBase58(),
+    };
   } else {
     // Default: Meteora CPAMM
     const { CpAmm } = await import('@meteora-ag/cp-amm-sdk');
@@ -84,6 +95,10 @@ export async function getPoolInfo(connection: Connection, poolAddress: string): 
 
 export function isRaydiumPool(type: PoolType): boolean {
   return type.startsWith('raydium-');
+}
+
+export function isDlmmPool(type: PoolType): boolean {
+  return type === 'meteora-dlmm';
 }
 
 export function getQuoteMint(poolInfo: PoolInfo, tokenMint: string): string {

@@ -81,45 +81,36 @@ export async function sellTokensFromWallets(
   const pool = new PublicKey(poolAddress);
   const mint = new PublicKey(tokenMint);
 
-  // Auto-detect token program (SPL vs Token-2022)
   const STANDARD_TOKEN = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
-  const mintAccountInfo = await connection.getAccountInfo(mint);
-  const tokenProgram = mintAccountInfo?.owner.equals(STANDARD_TOKEN) ? STANDARD_TOKEN : TOKEN_2022_PROGRAM_ID;
-
-  // Create CpAmm instance for DAMM v2
   const cpAmm = new CpAmm(connection as any);
 
-  // Detect quote token (tokenB) decimals and symbol
   const USDC_MINTS = [
-    'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // mainnet
-    '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU', // devnet
+    'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+    '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU',
   ];
   const WSOL_MINT = 'So11111111111111111111111111111111111111112';
-  let quoteBDecimals = 9; // default SOL
+  let quoteBDecimals = 9;
   let quoteSymbol = 'SOL';
 
-  try {
-    const initialPoolState = await cpAmm.fetchPoolState(pool);
-    const tokenBMintStr = initialPoolState.tokenBMint.toBase58();
-    if (USDC_MINTS.includes(tokenBMintStr)) {
-      quoteBDecimals = 6;
-      quoteSymbol = 'USDC';
-    } else if (tokenBMintStr === WSOL_MINT) {
-      quoteBDecimals = 9;
-      quoteSymbol = 'SOL';
-    }
-  } catch {
-    // fallback defaults
+  // Parallel: tokenProgram + poolState + slot + blockhash
+  const [mintAccountInfo, poolState, currentSlot, latestBlock] = await Promise.all([
+    connection.getAccountInfo(mint),
+    cpAmm.fetchPoolState(pool),
+    connection.getSlot(),
+    connection.getLatestBlockhash('confirmed'),
+  ]);
+  const tokenProgram = mintAccountInfo?.owner.equals(STANDARD_TOKEN) ? STANDARD_TOKEN : TOKEN_2022_PROGRAM_ID;
+
+  const tokenBMintStr = poolState.tokenBMint.toBase58();
+  if (USDC_MINTS.includes(tokenBMintStr)) {
+    quoteBDecimals = 6;
+    quoteSymbol = 'USDC';
+  } else if (tokenBMintStr === WSOL_MINT) {
+    quoteBDecimals = 9;
+    quoteSymbol = 'SOL';
   }
 
-  // Fetch pool state and time info once for all wallets
-  const poolState = await cpAmm.fetchPoolState(pool);
-  const currentSlot = await connection.getSlot();
-  let currentTime = Math.floor(Date.now() / 1000);
-  try {
-    const blockTime = await connection.getBlockTime(currentSlot - 2);
-    if (blockTime) currentTime = blockTime;
-  } catch {}
+  const currentTime = Math.floor(Date.now() / 1000);
   const slippage = slippageBps / 10000;
 
   // Build all swap txs in parallel
@@ -189,7 +180,7 @@ export async function sellTokensFromWallets(
           inputTokenMint: freshPoolState.tokenAMint,
           outputTokenMint: freshPoolState.tokenBMint,
           amountIn: swapAmount,
-          minimumAmountOut: quote.minSwapOutAmount,
+          minimumAmountOut: new BN(0),
           tokenAMint: freshPoolState.tokenAMint,
           tokenBMint: freshPoolState.tokenBMint,
           tokenAVault: freshPoolState.tokenAVault,
@@ -203,8 +194,7 @@ export async function sellTokensFromWallets(
           ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 })
         );
 
-        const { blockhash } = await connection.getLatestBlockhash('confirmed');
-        (swapTx as any).recentBlockhash = blockhash;
+        (swapTx as any).recentBlockhash = latestBlock.blockhash;
         (swapTx as any).feePayer = keypair.publicKey;
         (swapTx as any).sign(keypair);
 
@@ -583,7 +573,13 @@ export async function buyTokensForWallet(
 
   try {
     const keypair = Keypair.fromSecretKey(bs58.decode(wallet.privateKey));
-    const poolState = await cpAmm.fetchPoolState(pool);
+
+    // Parallel: fetchPoolState + getSlot + getLatestBlockhash
+    const [poolState, currentSlot, latestBlock] = await Promise.all([
+      cpAmm.fetchPoolState(pool),
+      connection.getSlot(),
+      connection.getLatestBlockhash('confirmed'),
+    ]);
 
     const tokenBMintStr = poolState.tokenBMint.toBase58();
     let quoteBDecimals = 9;
@@ -598,68 +594,41 @@ export async function buyTokensForWallet(
     );
 
     const slippage = slippageBps / 10000;
+    const currentTime = Math.floor(Date.now() / 1000);
 
-    // Reverse direction: input = tokenB (SOL/USDC), output = tokenA (token)
-    let quote;
-    let activePoolState = poolState;
-
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const currentSlot = await connection.getSlot();
-      let currentTime = Math.floor(Date.now() / 1000);
-      try {
-        const bt = await connection.getBlockTime(currentSlot - 2);
-        if (bt) currentTime = bt;
-      } catch {}
-
-      if (attempt > 0) {
-        await new Promise(r => setTimeout(r, 500));
-        activePoolState = await cpAmm.fetchPoolState(pool);
-      }
-
-      try {
-        quote = cpAmm.getQuote({
-          inAmount: rawQuoteAmount,
-          inputTokenMint: activePoolState.tokenBMint,
-          slippage,
-          poolState: activePoolState,
-          currentTime,
-          currentSlot,
-          tokenADecimal: decimals,
-          tokenBDecimal: quoteBDecimals,
-        });
-        break;
-      } catch (quoteErr) {
-        if (attempt === 2) throw quoteErr;
-      }
-    }
-    if (!quote) throw new Error('Failed to get buy quote after retries');
+    const quote = cpAmm.getQuote({
+      inAmount: rawQuoteAmount,
+      inputTokenMint: poolState.tokenBMint,
+      slippage,
+      poolState,
+      currentTime,
+      currentSlot,
+      tokenADecimal: decimals,
+      tokenBDecimal: quoteBDecimals,
+    });
 
     const swapTx = await cpAmm.swap({
       payer: keypair.publicKey,
       pool,
-      inputTokenMint: activePoolState.tokenBMint,
-      outputTokenMint: activePoolState.tokenAMint,
+      inputTokenMint: poolState.tokenBMint,
+      outputTokenMint: poolState.tokenAMint,
       amountIn: rawQuoteAmount,
-      minimumAmountOut: quote.minSwapOutAmount,
-      tokenAMint: activePoolState.tokenAMint,
-      tokenBMint: activePoolState.tokenBMint,
-      tokenAVault: activePoolState.tokenAVault,
-      tokenBVault: activePoolState.tokenBVault,
-      tokenAProgram: activePoolState.tokenAFlag
+      minimumAmountOut: new BN(0),
+      tokenAMint: poolState.tokenAMint,
+      tokenBMint: poolState.tokenBMint,
+      tokenAVault: poolState.tokenAVault,
+      tokenBVault: poolState.tokenBVault,
+      tokenAProgram: poolState.tokenAFlag
         ? TOKEN_2022_PROGRAM_ID
         : new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
-      tokenBProgram: (activePoolState as any).tokenBFlag
+      tokenBProgram: (poolState as any).tokenBFlag
         ? TOKEN_2022_PROGRAM_ID
         : new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
       referralTokenAccount: null,
     });
 
-    (swapTx as any).add(
-      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 })
-    );
-
-    const { blockhash } = await connection.getLatestBlockhash('confirmed');
-    (swapTx as any).recentBlockhash = blockhash;
+    (swapTx as any).add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }));
+    (swapTx as any).recentBlockhash = latestBlock.blockhash;
     (swapTx as any).feePayer = keypair.publicKey;
     (swapTx as any).sign(keypair);
 
@@ -669,42 +638,7 @@ export async function buyTokensForWallet(
       maxRetries: 5,
     });
 
-    // Parse confirmed transaction to get real token delta from preTokenBalances/postTokenBalances
-    let tokensReceived: number = 0;
-    const walletPubStr = keypair.publicKey.toBase58();
-    const tokenMintStr = mint.toBase58();
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        if (attempt > 0) await new Promise(r => setTimeout(r, 500));
-        const parsedTx = await connection.getParsedTransaction(sig, {
-          commitment: 'confirmed',
-          maxSupportedTransactionVersion: 0,
-        });
-        if (parsedTx?.meta) {
-          const pre = parsedTx.meta.preTokenBalances || [];
-          const post = parsedTx.meta.postTokenBalances || [];
-          // Find our wallet's token A balance change
-          for (const postBal of post) {
-            if (postBal.owner === walletPubStr && postBal.mint === tokenMintStr) {
-              const postAmount = Number(postBal.uiTokenAmount.uiAmount || 0);
-              // Find matching pre balance
-              const preBal = pre.find(
-                p => p.accountIndex === postBal.accountIndex
-              );
-              const preAmount = preBal ? Number(preBal.uiTokenAmount.uiAmount || 0) : 0;
-              tokensReceived = postAmount - preAmount;
-              break;
-            }
-          }
-          if (tokensReceived > 0) break;
-        }
-      } catch { /* retry */ }
-    }
-    // Fallback to quote estimate
-    if (tokensReceived <= 0) {
-      tokensReceived = Number(quote.swapOutAmount.toString()) / 10 ** decimals;
-      console.warn(`Buy: could not parse tx delta, fallback to quote: ${tokensReceived}`);
-    }
+    const tokensReceived = Number(quote.swapOutAmount.toString()) / 10 ** decimals;
 
     return {
       walletId: wallet.id,

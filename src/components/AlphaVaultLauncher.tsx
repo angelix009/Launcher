@@ -1007,12 +1007,20 @@ export default function AlphaVaultLauncher({
                 : <>Whitelist {selectedWalletIds.size} Wallets <Wallet className="w-4 h-4" /></>}
             </button>
           ) : (
-            <button
-              onClick={() => setStep('deposit')}
-              className="w-full bg-purple-600 hover:bg-purple-500 text-white font-medium py-3 rounded-xl transition-colors flex items-center justify-center gap-2"
-            >
-              Next: Fund & Deposit <ChevronRight className="w-4 h-4" />
-            </button>
+            <div className="flex gap-2">
+              <button
+                onClick={() => { setEscrowsCreated(0); setEscrowsFailed(0); }}
+                className="flex-1 bg-yellow-600 hover:bg-yellow-500 text-white font-medium py-3 rounded-xl transition-colors flex items-center justify-center gap-2"
+              >
+                Re-whitelist <Wallet className="w-4 h-4" />
+              </button>
+              <button
+                onClick={() => setStep('deposit')}
+                className="flex-1 bg-purple-600 hover:bg-purple-500 text-white font-medium py-3 rounded-xl transition-colors flex items-center justify-center gap-2"
+              >
+                Next: Fund & Deposit <ChevronRight className="w-4 h-4" />
+              </button>
+            </div>
           )}
         </div>
       )}

@@ -1,9 +1,10 @@
 import { NextResponse } from 'next/server';
 import { getConnection } from '@/lib/solana';
-import { getPoolInfo, isRaydiumPool, getQuoteMint } from '@/lib/pool-utils';
+import { getPoolInfo, isRaydiumPool, isDlmmPool, getQuoteMint } from '@/lib/pool-utils';
 import type { WalletEntry } from '@/types';
 
 export const dynamic = 'force-dynamic';
+export const maxDuration = 30;
 
 export async function POST(request: Request) {
   try {
@@ -45,6 +46,17 @@ export async function POST(request: Request) {
         const tokenAmount = wallet.tokenBalance * (percentage / 100);
         if (tokenAmount <= 0) continue;
         const result = await sellViaRaydium(connection, poolAddress, poolInfo.type, tokenMint, quoteMint, wallet, tokenAmount, slippage ?? 100, decimals ?? 6);
+        results.push(result);
+      }
+      return NextResponse.json({ success: true, data: results });
+    } else if (isDlmmPool(poolInfo.type)) {
+      const { sellViaDlmm } = await import('@/lib/sell');
+      const results = [];
+      const quoteMint = getQuoteMint(poolInfo, tokenMint);
+      for (const wallet of wallets) {
+        const tokenAmount = wallet.tokenBalance * (percentage / 100);
+        if (tokenAmount <= 0) continue;
+        const result = await sellViaDlmm(connection, poolAddress, tokenMint, quoteMint, wallet, tokenAmount, slippage ?? 100, decimals ?? 6);
         results.push(result);
       }
       return NextResponse.json({ success: true, data: results });

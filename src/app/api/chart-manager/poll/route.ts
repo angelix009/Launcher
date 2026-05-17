@@ -166,6 +166,9 @@ export async function POST(request: Request) {
       slippageBps,
       tokenDecimals,
       network,
+      accumulatedBuyDollars,
+      accumulatedBuyTokens,
+      accumThreshold,
     } = body;
 
     if (!poolAddress || !tokenMint) {
@@ -178,60 +181,69 @@ export async function POST(request: Request) {
     const processedTradesSet = new Set<string>(body.processedTrades || []);
     const events: ChartManagerEvent[] = [];
 
-    // Build pool contexts
-    const pool1Info = await getPoolInfo(connection, poolAddress);
-    const pool1 = buildPoolContext(poolAddress, pool1Info, tokenMint);
-
-    let pool2: PoolContext | null = null;
-    if (poolAddress2?.trim()) {
-      const pool2Info = await getPoolInfo(connection, poolAddress2.trim());
-      pool2 = buildPoolContext(poolAddress2.trim(), pool2Info, tokenMint);
-    }
-
-    // Fetch SOL price if any pool uses SOL as quote
-    let solPrice = 0;
-    if (pool1.quoteIsSOL || pool2?.quoteIsSOL) {
-      solPrice = await fetchSolPrice();
-      console.log('[CM] SOL price:', solPrice);
-    }
-
-    // Step 1: Get new signatures from pool 1 (since lastSignature)
+    // Parallel batch: pool info + signatures + SOL price — all at once
+    const hasPool2 = !!poolAddress2?.trim();
     const sigParams1: any = { limit: 50 };
     if (lastSignature) sigParams1.until = lastSignature;
 
-    const signatures1 = await connection.getSignaturesForAddress(new PublicKey(poolAddress), sigParams1);
-    let newLastSig = signatures1.length > 0 ? signatures1[0].signature : (lastSignature || null);
+    const parallelPromises: Promise<any>[] = [
+      getPoolInfo(connection, poolAddress),
+      connection.getSignaturesForAddress(new PublicKey(poolAddress), sigParams1),
+      lastSignature ? connection.getSignaturesForAddress(new PublicKey(poolAddress), { limit: 50 }) : Promise.resolve([]),
+      fetchSolPrice(),
+    ];
 
-    // Also fetch last 20 as safety net to catch missed signatures (only keep those newer than lastSignature)
+    if (hasPool2) {
+      const sigParams2: any = { limit: 50 };
+      if (lastSignature2) sigParams2.until = lastSignature2;
+      parallelPromises.push(
+        getPoolInfo(connection, poolAddress2.trim()),
+        connection.getSignaturesForAddress(new PublicKey(poolAddress2.trim()), sigParams2),
+        lastSignature2 ? connection.getSignaturesForAddress(new PublicKey(poolAddress2.trim()), { limit: 50 }) : Promise.resolve([]),
+      );
+    }
+
+    const parallelResults = await Promise.all(parallelPromises);
+
+    const pool1Info = parallelResults[0];
+    const pool1 = buildPoolContext(poolAddress, pool1Info, tokenMint);
+    const signatures1 = parallelResults[1];
+    const rawSafety1 = parallelResults[2];
+    const solPrice = parallelResults[3] as number;
+
+    let newLastSig = signatures1.length > 0 ? signatures1[0].signature : (lastSignature || null);
     let safetyNet1: any[] = [];
-    if (lastSignature) {
-      const raw = await connection.getSignaturesForAddress(new PublicKey(poolAddress), { limit: 20 });
-      const cutoff = raw.findIndex((s: any) => s.signature === lastSignature);
-      safetyNet1 = cutoff >= 0 ? raw.slice(0, cutoff) : [];
+    if (lastSignature && rawSafety1.length > 0) {
+      const cutoff = rawSafety1.findIndex((s: any) => s.signature === lastSignature);
+      safetyNet1 = cutoff >= 0 ? rawSafety1.slice(0, cutoff) : [];
       if (safetyNet1.length > 0) newLastSig = safetyNet1[0].signature;
     }
 
-    // Get new signatures from pool 2
+    let pool2: PoolContext | null = null;
     let newLastSig2 = lastSignature2 || null;
     let signatures2: any[] = [];
     let safetyNet2: any[] = [];
-    if (pool2) {
-      const sigParams2: any = { limit: 50 };
-      if (lastSignature2) sigParams2.until = lastSignature2;
-      signatures2 = await connection.getSignaturesForAddress(new PublicKey(poolAddress2.trim()), sigParams2);
+    if (hasPool2) {
+      const pool2Info = parallelResults[4];
+      pool2 = buildPoolContext(poolAddress2.trim(), pool2Info, tokenMint);
+      signatures2 = parallelResults[5];
+      const rawSafety2 = parallelResults[6];
       if (signatures2.length > 0) newLastSig2 = signatures2[0].signature;
-
-      if (lastSignature2) {
-        const raw2 = await connection.getSignaturesForAddress(new PublicKey(poolAddress2.trim()), { limit: 20 });
-        const cutoff2 = raw2.findIndex((s: any) => s.signature === lastSignature2);
-        safetyNet2 = cutoff2 >= 0 ? raw2.slice(0, cutoff2) : [];
+      if (lastSignature2 && rawSafety2.length > 0) {
+        const cutoff2 = rawSafety2.findIndex((s: any) => s.signature === lastSignature2);
+        safetyNet2 = cutoff2 >= 0 ? rawSafety2.slice(0, cutoff2) : [];
         if (safetyNet2.length > 0) newLastSig2 = safetyNet2[0].signature;
       }
     }
 
     const totalSigs = signatures1.length + signatures2.length + safetyNet1.length + safetyNet2.length;
 
-    if (totalSigs === 0) {
+    const accumDollars = accumulatedBuyDollars || 0;
+    const accumTokens = accumulatedBuyTokens || 0;
+    const accumThresh = accumThreshold || 25;
+    const needsAccumSell = accumDollars >= accumThresh && accumTokens > 0 && (mode === 'sell-on-buy' || mode === 'both');
+
+    if (totalSigs === 0 && !needsAccumSell) {
       return NextResponse.json({
         success: true,
         data: { events: [], lastSignature: lastSignature || null, lastSignature2: newLastSig2 },
@@ -250,27 +262,32 @@ export async function POST(request: Request) {
       });
     }
 
-    // Step 2: Merge and deduplicate signatures, tag with pool — skip already-processed everywhere
-    const sigPoolMap = new Map<string, PoolContext>();
+    // Step 2: Merge and deduplicate signatures, tag with pool(s) — one sig can touch both pools (routed trades)
+    const sigPoolMap = new Map<string, PoolContext[]>();
+    const addSigPool = (sig: string, pool: PoolContext) => {
+      const existing = sigPoolMap.get(sig);
+      if (existing) { if (!existing.includes(pool)) existing.push(pool); }
+      else sigPoolMap.set(sig, [pool]);
+    };
     for (const s of signatures1) {
       if (lastSignature && !processedTradesSet.has(s.signature)) {
-        sigPoolMap.set(s.signature, pool1);
+        addSigPool(s.signature, pool1);
       }
     }
     for (const s of safetyNet1) {
-      if (!sigPoolMap.has(s.signature) && !processedTradesSet.has(s.signature)) {
-        sigPoolMap.set(s.signature, pool1);
+      if (!processedTradesSet.has(s.signature)) {
+        addSigPool(s.signature, pool1);
       }
     }
     if (pool2 && lastSignature2) {
       for (const s of signatures2) {
-        if (!sigPoolMap.has(s.signature) && !processedTradesSet.has(s.signature)) {
-          sigPoolMap.set(s.signature, pool2);
+        if (!processedTradesSet.has(s.signature)) {
+          addSigPool(s.signature, pool2);
         }
       }
       for (const s of safetyNet2) {
-        if (!sigPoolMap.has(s.signature) && !processedTradesSet.has(s.signature)) {
-          sigPoolMap.set(s.signature, pool2);
+        if (!processedTradesSet.has(s.signature)) {
+          addSigPool(s.signature, pool2);
         }
       }
     }
@@ -282,7 +299,7 @@ export async function POST(request: Request) {
     const parsedTxs = await fetchParsedTransactions(allSigList);
     console.log('[CM] Helius returned', parsedTxs.length, 'parsed txs');
 
-    // Step 4: Detect external trades via vault flow cross-validation
+    // Step 4: Detect external trades via vault flow cross-validation — analyze each pool independently
     const trades: DetectedTrade[] = [];
 
     for (const tx of parsedTxs) {
@@ -295,54 +312,64 @@ export async function POST(request: Request) {
       if (ownWalletSet.has(feePayer)) continue;
 
       const transfers = tx.tokenTransfers || [];
-      const pool = sigPoolMap.get(tx.signature) || pool1;
+      const pools = sigPoolMap.get(tx.signature) || [pool1];
 
-      let tokenFromVault = 0;
-      let tokenToVault = 0;
-      let quoteFromVault = 0;
-      let quoteToVault = 0;
+      for (const pool of pools) {
+        let tokenFromVault = 0;
+        let tokenToVault = 0;
+        let quoteFromVault = 0;
+        let quoteToVault = 0;
 
-      for (const t of transfers) {
-        const mint = t.mint || '';
-        const amount = t.tokenAmount || 0;
-        if (amount <= 0) continue;
+        for (const t of transfers) {
+          const mint = t.mint || '';
+          const amount = t.tokenAmount || 0;
+          if (amount <= 0) continue;
 
-        const fromAcct = t.fromTokenAccount || t.fromUserAccount || '';
-        const toAcct = t.toTokenAccount || t.toUserAccount || '';
+          const fromAcct = t.fromTokenAccount || t.fromUserAccount || '';
+          const toAcct = t.toTokenAccount || t.toUserAccount || '';
 
-        if (mint === tokenMint) {
-          if (fromAcct === pool.tokenVault) tokenFromVault += amount;
-          if (toAcct === pool.tokenVault) tokenToVault += amount;
+          if (mint === tokenMint) {
+            if (fromAcct === pool.tokenVault) tokenFromVault += amount;
+            if (toAcct === pool.tokenVault) tokenToVault += amount;
+          }
+
+          if (QUOTE_MINTS.has(mint)) {
+            if (fromAcct === pool.quoteVault) quoteFromVault += amount;
+            if (toAcct === pool.quoteVault) quoteToVault += amount;
+          }
         }
 
-        if (QUOTE_MINTS.has(mint)) {
-          if (fromAcct === pool.quoteVault) quoteFromVault += amount;
-          if (toAcct === pool.quoteVault) quoteToVault += amount;
-        }
-      }
+        const netTokenOut = tokenFromVault - tokenToVault;
+        const netQuoteOut = quoteFromVault - quoteToVault;
 
-      const netTokenOut = tokenFromVault - tokenToVault;
-      const netQuoteOut = quoteFromVault - quoteToVault;
-
-      if (netTokenOut > 0 && netQuoteOut < 0) {
-        const quoteAmount = Math.abs(netQuoteOut);
-        const dollarAmount = pool.quoteIsSOL ? quoteAmount * solPrice : quoteAmount;
-        if (dollarAmount >= (minDollar || 0)) {
-          trades.push({
-            signature: tx.signature, type: 'external-buy',
-            tokenAmount: netTokenOut, quoteAmount, dollarAmount,
-            trader: feePayer, timestamp: tx.timestamp || 0, pool,
-          });
-        }
-      } else if (netTokenOut < 0 && netQuoteOut > 0) {
-        const tokenAmount = Math.abs(netTokenOut);
-        const dollarAmount = pool.quoteIsSOL ? netQuoteOut * solPrice : netQuoteOut;
-        if (dollarAmount >= (minDollar || 0)) {
-          trades.push({
-            signature: tx.signature, type: 'external-sell',
-            tokenAmount, quoteAmount: netQuoteOut, dollarAmount,
-            trader: feePayer, timestamp: tx.timestamp || 0, pool,
-          });
+        if (netTokenOut > 0 && netQuoteOut < 0) {
+          const quoteAmount = Math.abs(netQuoteOut);
+          const dollarAmount = pool.quoteIsSOL ? quoteAmount * solPrice : quoteAmount;
+          if (dollarAmount >= (minDollar || 0)) {
+            trades.push({
+              signature: tx.signature, type: 'external-buy',
+              tokenAmount: netTokenOut, quoteAmount, dollarAmount,
+              trader: feePayer, timestamp: tx.timestamp || 0, pool,
+            });
+          } else if (dollarAmount > 0) {
+            const poolLabel = pool === pool2 ? '[SOL]' : '[USDC]';
+            events.push({
+              id: `sub-${tx.signature.slice(0, 12)}-${pool === pool2 ? 'p2' : 'p1'}`, timestamp: new Date().toISOString(),
+              type: 'sub-threshold' as any, tokenAmount: netTokenOut, dollarAmount,
+              signature: tx.signature,
+              message: `${poolLabel} Small buy $${dollarAmount.toFixed(2)} by ${feePayer.slice(0, 8)}...`,
+            });
+          }
+        } else if (netTokenOut < 0 && netQuoteOut > 0) {
+          const tokenAmount = Math.abs(netTokenOut);
+          const dollarAmount = pool.quoteIsSOL ? netQuoteOut * solPrice : netQuoteOut;
+          if (dollarAmount >= (minDollar || 0)) {
+            trades.push({
+              signature: tx.signature, type: 'external-sell',
+              tokenAmount, quoteAmount: netQuoteOut, dollarAmount,
+              trader: feePayer, timestamp: tx.timestamp || 0, pool,
+            });
+          }
         }
       }
     }
@@ -378,14 +405,14 @@ export async function POST(request: Request) {
 
         const minSellable = 1 / 10 ** (tokenDecimals || 6);
         const eligible = sellWallets
-          .filter((w: WalletEntry) => w.tokenBalance > minSellable)
+          .filter((w: WalletEntry) => w.tokenBalance > minSellable && (w.solBalance || 0) >= 0.03)
           .sort((a: WalletEntry, b: WalletEntry) => b.tokenBalance - a.tokenBalance);
 
         if (eligible.length === 0) {
           events.push({
             id: `skip-${eventId}`, timestamp: new Date().toISOString(), type: 'skip',
             tokenAmount: trade.tokenAmount, dollarAmount: trade.dollarAmount, signature: trade.signature,
-            message: 'No wallets with tokens available for counter-sell',
+            message: 'No wallets with tokens + SOL for fees available for counter-sell',
           });
           continue;
         }
@@ -468,8 +495,8 @@ export async function POST(request: Request) {
       if (trade.type === 'external-sell' && (mode === 'buy-on-sell' || mode === 'both')) {
         const buyWallets = (body.buyWallets || []) as WalletEntry[];
         const eligible = trade.pool.quoteIsSOL
-          ? buyWallets.filter((w: WalletEntry) => (w.solBalance || 0) > 0.01).sort((a: WalletEntry, b: WalletEntry) => (b.solBalance || 0) - (a.solBalance || 0))
-          : buyWallets.filter((w: WalletEntry) => (w.usdcBalance || 0) > 0.001).sort((a: WalletEntry, b: WalletEntry) => b.usdcBalance - a.usdcBalance);
+          ? buyWallets.filter((w: WalletEntry) => (w.solBalance || 0) > 0.03).sort((a: WalletEntry, b: WalletEntry) => (b.solBalance || 0) - (a.solBalance || 0))
+          : buyWallets.filter((w: WalletEntry) => (w.usdcBalance || 0) > 0.001 && (w.solBalance || 0) >= 0.03).sort((a: WalletEntry, b: WalletEntry) => b.usdcBalance - a.usdcBalance);
 
         if (eligible.length === 0) {
           events.push({
@@ -480,7 +507,7 @@ export async function POST(request: Request) {
           continue;
         }
 
-        let remaining = trade.quoteAmount;
+        let remaining = trade.quoteAmount * 1.005;
         if (remaining <= 0) {
           events.push({
             id: `skip-${eventId}`, timestamp: new Date().toISOString(), type: 'skip',
@@ -540,6 +567,51 @@ export async function POST(request: Request) {
       }
     }
 
+    // Accumulated buy counter-sell
+    if (needsAccumSell && sellWallets && sellWallets.length > 0) {
+      const minSellable = 1 / 10 ** (tokenDecimals || 6);
+      const accumEligible = sellWallets
+        .filter((w: WalletEntry) => w.tokenBalance > minSellable && (w.solBalance || 0) >= 0.03)
+        .sort((a: WalletEntry, b: WalletEntry) => b.tokenBalance - a.tokenBalance);
+
+      if (accumEligible.length > 0) {
+        let remaining = accumTokens * 0.75;
+        let accumSold = false;
+
+        for (const wallet of accumEligible) {
+          if (remaining <= minSellable) break;
+          const sellAmount = Math.min(remaining, wallet.tokenBalance);
+          if (sellAmount <= minSellable) continue;
+
+          try {
+            const result = await executeSell(connection, pool1, tokenMint, wallet, sellAmount, 10000, tokenDecimals || 6);
+            if (result.signature) {
+              remaining -= result.amountSold;
+              wallet.tokenBalance -= result.amountSold;
+              accumSold = true;
+              events.push({
+                id: `accum-sell-${Date.now()}-${wallet.publicKey.slice(0, 6)}`,
+                timestamp: new Date().toISOString(), type: 'counter-sell',
+                tokenAmount: result.amountSold, dollarAmount: result.quoteReceived || 0,
+                signature: 'accumulated', counterSignature: result.signature,
+                wallet: wallet.publicKey.slice(0, 8),
+                message: `[ACCUM] Counter-sold ${result.amountSold.toLocaleString()} tokens ($${accumDollars.toFixed(2)} accumulated) via ${wallet.label || wallet.publicKey.slice(0, 8)}`,
+              });
+            }
+          } catch {}
+        }
+
+        if (accumSold) {
+          events.push({
+            id: `accum-reset-${Date.now()}`, timestamp: new Date().toISOString(),
+            type: 'accum-reset' as any, tokenAmount: 0, dollarAmount: accumDollars,
+            signature: 'accumulated',
+            message: `[ACCUM] Reset accumulator ($${accumDollars.toFixed(2)})`,
+          });
+        }
+      }
+    }
+
     // Bonus micro-buy after each successful counter-trade (on both pools)
     const allBuyWallets = (body.buyWallets || []) as WalletEntry[];
     const counterEvents = events.filter(e =>
@@ -558,8 +630,9 @@ export async function POST(request: Request) {
       const eligible = allBuyWallets
         .filter((w: WalletEntry) => {
           if (w.publicKey.slice(0, 8) === ce.wallet) return false;
+          if ((w.solBalance || 0) < 0.03) return false;
           return microIsSOL
-            ? (w.solBalance || 0) >= microAmount
+            ? (w.solBalance || 0) >= microAmount + 0.03
             : (w.usdcBalance || 0) >= microAmount;
         })
         .sort(() => Math.random() - 0.5);

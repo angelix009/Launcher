@@ -152,7 +152,7 @@ export async function createToken2022(
       });
       if (pinataRes.ok) {
         const { IpfsHash } = await pinataRes.json();
-        metadataUri = `https://${process.env.PINATA_GATEWAY || 'goal.mypinata.cloud'}/ipfs/${IpfsHash}`;
+        metadataUri = `https://${process.env.PINATA_GATEWAY || 'coar.mypinata.cloud'}/ipfs/${IpfsHash}`;
       }
     } catch (e) {
       console.warn('Failed to upload metadata JSON, falling back to image URL:', e);
@@ -379,7 +379,7 @@ export async function createTokenSPL(
       });
       if (pinataRes.ok) {
         const { IpfsHash } = await pinataRes.json();
-        metadataUri = `https://${process.env.PINATA_GATEWAY || 'goal.mypinata.cloud'}/ipfs/${IpfsHash}`;
+        metadataUri = `https://${process.env.PINATA_GATEWAY || 'coar.mypinata.cloud'}/ipfs/${IpfsHash}`;
       }
     } catch (e) {
       console.warn('Failed to upload metadata JSON:', e);
